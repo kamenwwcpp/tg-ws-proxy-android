@@ -34,7 +34,12 @@ object ProxyController {
         val secretKey = ensureSecretKey(settingsStore)
 
         val parsedIps = buildList {
-            if (!isDcAuto) {
+            if (isDcAuto) {
+                // Дефолт апстрима (proxy/config.py dc_redirects). Пустой список гнал
+                // весь трафик в CF fallback, а CF в РФ режется ТСПУ.
+                appendDc(2, SettingsStore.DEFAULT_DIRECT_DC2_IP)
+                appendDc(4, SettingsStore.DEFAULT_DIRECT_DC4_IP)
+            } else {
                 appendDc(1, settingsStore.dc1.first())
                 appendDc(2, settingsStore.dc2.first())
                 appendDc(3, settingsStore.dc3.first())

@@ -51,6 +51,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.amurcanov.tgwsproxy.ui.AppUpdateDialog
 import com.amurcanov.tgwsproxy.ui.ConnectionTab
@@ -193,9 +194,10 @@ fun MainContent(settingsStore: SettingsStore) {
     val safeBottomInset = with(density) { WindowInsets.safeDrawing.getBottom(density).toDp() }
     val navOverlayReserve = safeBottomInset + 96.dp
 
-    DisposableEffect(Unit) {
+    // Только пока UI видим: свёрнутое приложение не должно держать logcat-процесс.
+    LifecycleStartEffect(Unit) {
         LogManager.startListening()
-        onDispose { LogManager.stopListening() }
+        onStopOrDispose { LogManager.stopListening() }
     }
 
     LaunchedEffect(updateCheckIntervalHours, updateLastCheckAt) {
@@ -630,7 +632,8 @@ object LogManager {
             launch {
                 val pendingBatch = mutableListOf<LogEntry>()
                 while (isActive) {
-                    // Drain the channel (non-blocking)
+                    // Suspend until something arrives instead of polling every 150ms
+                    pendingBatch.add(logChannel.receive())
                     var received = logChannel.tryReceive()
                     while (received.isSuccess) {
                         pendingBatch.add(received.getOrThrow())

@@ -19,7 +19,7 @@
     <string name="settings">Настройки</string>
     <string name="connection">Подключение</string>
     <string name="port">Порт</string>
-    <string name="auto_cf_enabled">Авто (Включён CF)</string>
+    <string name="auto_cf_enabled">Авто (прямой WS)</string>
     <string name="configure_dc_addresses">Настроить адреса DC</string>
     <string name="ws_pool">Пул WS</string>
     <string name="secret_key">Секретный ключ</string>
@@ -64,7 +64,7 @@
     <string name="useful_material_subtitle">Заметки по работе прокси от IMDelewer</string>
     <string name="update_postponed_24h">Обновление отложено на 24 часа.</string>
     <string name="help_auto_dc_title">Авто / Адреса датацентров</string>
-    <string name="help_auto_dc_text">При включенном CloudFlare ручные адреса DC обычно не нужны: прокси использует CF-маршрут. Если CloudFlare выключен, соединение идёт напрямую на Telegram DC, и тогда можно задать адреса вручную. В обычном режиме чаще всего достаточно DC2 и DC4; остальные адреса нужны в основном для ручной настройки и диагностики.</string>
+    <string name="help_auto_dc_text">В режиме «Авто» прокси идёт напрямую на Telegram через WebSocket (DC2 и DC4 через 149.154.167.220, как в Windows-версии). Если прямой путь не работает, используется TCP, и только потом CloudFlare (в РФ CF часто режется, поэтому он последний). Ручные адреса DC нужны в основном для диагностики.</string>
     <string name="help_cloudflare_text">Этот режим направляет соединение через WebSocket-домены за Cloudflare. На части мобильных сетей он работает стабильнее, но итог зависит от маршрута, DNS и конкретного провайдера. Если на вашей сети подключение стало дольше или менее стабильным, имеет смысл сравнить работу с выключенным CF.</string>
     <string name="help_ws_pool_text">Количество заранее подготовленных WebSocket-соединений. Больший пул может уменьшить задержку при первом подключении и загрузке медиа, но увеличивает число фоновых соединений. Для большинства сценариев достаточно 2-4; повышать значение стоит только если реально видна польза на вашей сети.</string>
     <string name="help_secret_key_text">Специальный 16-байтовый ключ шифрования MTProto. Меняйте его только в случае, если старой ссылкой для подключения завладели посторонние.</string>

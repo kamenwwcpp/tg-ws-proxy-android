@@ -19,7 +19,7 @@
     <string name="settings">Settings</string>
     <string name="connection">Connection</string>
     <string name="port">Port</string>
-    <string name="auto_cf_enabled">Auto (CF enabled)</string>
+    <string name="auto_cf_enabled">Auto (direct WS)</string>
     <string name="configure_dc_addresses">Configure DC addresses</string>
     <string name="ws_pool">WS pool</string>
     <string name="secret_key">Secret key</string>
@@ -64,7 +64,7 @@
     <string name="useful_material_subtitle">Proxy notes by IMDelewer</string>
     <string name="update_postponed_24h">Update postponed for 24 hours.</string>
     <string name="help_auto_dc_title">Auto / data center addresses</string>
-    <string name="help_auto_dc_text">When Cloudflare is enabled, manual DC addresses are usually not needed: the proxy uses the CF route. If Cloudflare is disabled, the connection goes directly to Telegram DCs, and you can set addresses manually. In normal mode DC2 and DC4 are usually enough; the other addresses are mainly for manual setup and diagnostics.</string>
+    <string name="help_auto_dc_text">In Auto mode the proxy connects directly to Telegram over WebSocket (DC2 and DC4 via 149.154.167.220, same as the desktop version). If the direct route fails, plain TCP is tried, and Cloudflare is used last (it is often throttled in Russia). Manual DC addresses are mainly for diagnostics.</string>
     <string name="help_cloudflare_text">This mode routes the connection through WebSocket domains behind Cloudflare. It can be more stable on some mobile networks, but the result depends on routing, DNS, and the provider. If the connection became slower or less stable on your network, compare it with CF disabled.</string>
     <string name="help_ws_pool_text">The number of pre-warmed WebSocket connections. A larger pool can reduce delay during the first connection and media loading, but increases background connections. For most cases 2-4 is enough; increase it only if you can see a real benefit on your network.</string>
     <string name="help_secret_key_text">A special 16-byte MTProto encryption key. Change it only if someone else got access to your old connection link.</string>

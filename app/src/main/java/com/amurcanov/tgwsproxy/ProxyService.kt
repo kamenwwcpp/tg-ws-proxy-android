@@ -5,7 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
@@ -23,8 +26,8 @@ import java.net.ServerSocket
 
 class ProxyService : Service() {
 
-    private var wakeLock: PowerManager.WakeLock? = null
     private var statsJob: Job? = null
+    private var screenReceiver: BroadcastReceiver? = null
     private var restartJob: Job? = null
     private var lastNotificationContent: String = ""
     private var lastNotificationAtMs: Long = 0L
@@ -60,13 +63,9 @@ class ProxyService : Service() {
         private const val CHANNEL_ID = "TG_WS_Proxy_Service_v4"
         private const val TAG = "ProxyService"
 
-        // Wakelock refresh interval (25 min, re-acquire before 30-min timeout)
-        private const val WAKELOCK_TIMEOUT_MS = 30L * 60 * 1000
-        private const val WAKELOCK_REFRESH_MS = 25L * 60 * 1000
-
-        // Stats/notification update interval
-        private const val STATS_UPDATE_MS = 3_000L
-        private const val NOTIFICATION_MIN_UPDATE_MS = 3_000L
+        // Stats/notification update interval (only while the screen is on)
+        private const val STATS_UPDATE_MS = 5_000L
+        private const val NOTIFICATION_MIN_UPDATE_MS = 5_000L
         private const val NATIVE_STOP_WAIT_MS = 3_000L
 
         private val _isRunning = MutableStateFlow(false)
@@ -160,7 +159,8 @@ class ProxyService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
 
-        acquireWakeLock()
+        // Без WakeLock: FGS сохраняет сеть в Doze, а входящий пакет сам будит CPU.
+        // Постоянный PARTIAL_WAKE_LOCK не давал процессору засыпать вообще.
         stopInProgress = false
         
         // Start Go proxy in a separate thread with error handling
@@ -211,18 +211,15 @@ class ProxyService : Service() {
             start()
         }
 
-                    // Don't stop — it might start slightly later; let the user decide
-        // Stats updater. Notification updates are throttled so the system keeps
-        // a stable foreground entry instead of constantly reordering it.
-        statsJob = serviceScope.launch {
-            // WakeLock refresh sub-job: re-acquire before system timeout
-            launch {
-                while (isActive) {
-                    delay(WAKELOCK_REFRESH_MS.milliseconds)
-                    refreshWakeLock()
-                }
-            }
+        registerScreenReceiver()
+        if ((getSystemService(POWER_SERVICE) as PowerManager).isInteractive) {
+            startStatsUpdates()
+        }
+    }
 
+    private fun startStatsUpdates() {
+        if (statsJob?.isActive == true) return
+        statsJob = serviceScope.launch {
             while (isActive) {
                 delay(STATS_UPDATE_MS.milliseconds)
                 if (_isRunning.value && !stopInProgress) {
@@ -231,7 +228,7 @@ class ProxyService : Service() {
                         val upRaw = extractStat(rawStats, "up=")
                         val downRaw = extractStat(rawStats, "down=")
                         val activeConns = extractStat(rawStats, "active=")
-                        
+
                         val totalBytes = parseHumanBytes(upRaw) + parseHumanBytes(downRaw)
                         val active = activeConns.toIntOrNull() ?: 0
                         val text = getString(R.string.notification_traffic, formatBytes(totalBytes), active)
@@ -242,6 +239,41 @@ class ProxyService : Service() {
                 }
             }
         }
+    }
+
+    private fun stopStatsUpdates() {
+        statsJob?.cancel()
+        statsJob = null
+    }
+
+    // Уведомление при выключенном экране никто не видит — не дёргаем JNI и
+    // NotificationManager впустую.
+    private fun registerScreenReceiver() {
+        if (screenReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                when (intent.action) {
+                    Intent.ACTION_SCREEN_ON -> if (_isRunning.value && !stopInProgress) startStatsUpdates()
+                    Intent.ACTION_SCREEN_OFF -> stopStatsUpdates()
+                }
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        }
+        registerReceiver(receiver, filter)
+        screenReceiver = receiver
+    }
+
+    private fun unregisterScreenReceiver() {
+        screenReceiver?.let {
+            try {
+                unregisterReceiver(it)
+            } catch (_: IllegalArgumentException) {
+            }
+        }
+        screenReceiver = null
     }
 
     private fun updateNotification(content: String, force: Boolean = false) {
@@ -272,11 +304,9 @@ class ProxyService : Service() {
             Log.i(TAG, "Restarting proxy from notification")
             updateNotification(getString(R.string.notification_restarting), force = true)
 
-            statsJob?.cancel()
-            statsJob = null
+            stopStatsUpdates()
 
             requestNativeStop("restart")
-            releaseWakeLock()
             updateRunningState(false)
             delay(350.milliseconds)
 
@@ -324,12 +354,11 @@ class ProxyService : Service() {
         stopInProgress = true
         restartJob?.cancel()
         restartJob = null
-        statsJob?.cancel()
-        statsJob = null
+        stopStatsUpdates()
+        unregisterScreenReceiver()
         serviceScope.launch {
             updateNotification(getString(R.string.notification_stopping), force = true)
             requestNativeStop("stop")
-            releaseWakeLock()
             updateRunningState(false)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -378,58 +407,6 @@ class ProxyService : Service() {
             // The service continues because stopWithTask=false in manifest
             // No action needed — the service keeps running.
         }
-    }
-
-    private fun acquireWakeLock() {
-        try {
-            val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "TgWsProxy::ServiceWakeLock"
-            ).apply {
-                // Acquire with timeout. System may ignore indefinite wakelocks.
-                acquire(WAKELOCK_TIMEOUT_MS)
-            }
-            Log.d(TAG, "WakeLock acquired (${WAKELOCK_TIMEOUT_MS / 60000}min)")
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to acquire WakeLock", e)
-        }
-    }
-
-    /**
-     * Periodically refresh wakelock to prevent system from expiring it.
-     */
-    private fun refreshWakeLock() {
-        try {
-            wakeLock?.let {
-                if (it.isHeld) {
-                    it.release()
-                }
-            }
-            val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "TgWsProxy::ServiceWakeLock"
-            ).apply {
-                acquire(WAKELOCK_TIMEOUT_MS)
-            }
-            Log.d(TAG, "WakeLock refreshed")
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to refresh WakeLock", e)
-        }
-    }
-
-    private fun releaseWakeLock() {
-        try {
-            wakeLock?.let {
-                if (it.isHeld) {
-                    it.release()
-                }
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to release WakeLock", e)
-        }
-        wakeLock = null
     }
 
     private fun updateRunningState(isRunning: Boolean) {
@@ -503,9 +480,8 @@ class ProxyService : Service() {
     override fun onDestroy() {
         restartJob?.cancel()
         restartJob = null
-        statsJob?.cancel()
-        statsJob = null
-        releaseWakeLock()
+        stopStatsUpdates()
+        unregisterScreenReceiver()
         if (_isRunning.value) {
             updateRunningState(false)
         }

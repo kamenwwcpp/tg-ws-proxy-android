@@ -37,7 +37,7 @@ fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
         // Многопоточный рантайм, кол-во воркеров адекватно мобиле
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
+            .worker_threads(2)
             .thread_name("tgwsproxy-rt")
             .enable_all()
             .build()
@@ -174,6 +174,7 @@ pub extern "C" fn StopProxy() -> c_int {
     WS_BLACKLIST.write().clear();
     DC_FAIL_UNTIL.write().clear();
     IP_FAIL_UNTIL.write().clear();
+    proxy::reset_tcp_backoff();
     cfproxy::clear_cfproxy_429_cooldowns();
     proxy::set_ws_pool_fronting_first(true);
 

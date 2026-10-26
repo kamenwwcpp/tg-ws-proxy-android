@@ -15,11 +15,16 @@ pub const DEFAULT_SEND_BUF: usize = 256 * 1024;
 pub const DEFAULT_POOL_SZ: i32 = 4;
 
 // proxy/tg_ws_proxy.py: IP_FAIL_COOLDOWN / DC_FAIL_COOLDOWN / WS_FAIL_TIMEOUT
-pub const IP_FAIL_COOLDOWN: f64 = 3600.0;
+pub const IP_FAIL_COOLDOWN: f64 = 300.0;
 pub const DC_FAIL_COOLDOWN: f64 = 60.0;
 pub const WS_FAIL_TIMEOUT: f64 = 2.0;
 // Прямой WS-коннект при отсутствии cooldown — 5.0 как в оригинале.
 pub const WS_DIRECT_TIMEOUT: f64 = 5.0;
+pub const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+pub const TCP_BACKOFF_INITIAL: f64 = 30.0;
+// Апстрим держит до 3600s; на телефоне сеть меняется часто (wifi <-> LTE),
+// час без TCP после одной неудачи — слишком долго.
+pub const TCP_BACKOFF_MAX: f64 = 600.0;
 
 // proxy/utils.py — MTProto handshake layout
 pub const HANDSHAKE_LEN: usize = 64;
@@ -41,8 +46,15 @@ pub const PROTO_PADDED_INTERMEDIATE_INT: u32 = 0xDDDDDDDD;
 // proxy/utils.py — зарезервированные префиксы relay_init
 pub const RESERVED_FIRST_BYTE: u8 = 0xEF;
 
-pub const BRIDGE_READ_TIMEOUT: Duration = Duration::from_secs(120);
-pub const BRIDGE_PING_INTERVAL: Duration = Duration::from_secs(30);
+// Клиент — Telegram на localhost: его смерть видна по EOF/RST. Короткий таймаут
+// рвал простаивающие в фоне сессии -> реконнект-шторм и лишние подъёмы радио.
+pub const BRIDGE_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+// Апстрим: pong сбрасывает таймер чтения (таймаут на один фрейм), так что
+// живой WS по нему не умирает; срабатывает только на реально мёртвом линке.
+pub const BRIDGE_READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+// Пинг только если WS молчит дольше этого. Каждый пинг будит LTE/5G радио
+// (~10s tail), 30s было слишком часто; NAT у операторов держит дольше 2 минут.
+pub const BRIDGE_PING_INTERVAL: Duration = Duration::from_secs(120);
 pub const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const WS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 pub const WS_BRIDGE_CHUNK_SIZE: usize = 64 * 1024;

@@ -807,7 +807,9 @@ pub async fn bridge_ws<R, W>(
     let dc_tag = format!("DC{}{}", dc, if is_media { "m" } else { "" });
     let ws = Arc::new(ws);
     let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
-    let cancel = Arc::new(tokio::sync::Notify::new());
+    // Sticky: Notify::notify_waiters терял сигнал, если вторая половина
+    // в этот момент висела в write/send — полумёртвый мост жил до таймаута.
+    let cancel = cancel_token.child_token();
     let start = now_monotonic();
 
     let mut conn_read = conn_read;
@@ -819,17 +821,18 @@ pub async fn bridge_ws<R, W>(
     let cancel_ping = cancel.clone();
     let cancel_token_ping = cancel_token.clone();
     let ping_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(BRIDGE_PING_INTERVAL);
+        let mut interval = tokio::time::interval(BRIDGE_PING_INTERVAL / 2);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await;
         loop {
             tokio::select! {
                 _ = cancel_token_ping.cancelled() => return,
-                _ = cancel_ping.notified() => return,
+                _ = cancel_ping.cancelled() => return,
                 _ = interval.tick() => {
                     let idle = la_ping.lock().await.elapsed();
                     if idle > BRIDGE_PING_INTERVAL {
                         if ws_ping.send_ping().await.is_err() {
-                            cancel_ping.notify_waiters();
+                            cancel_ping.cancel();
                             return;
                         }
                     }
@@ -854,8 +857,8 @@ pub async fn bridge_ws<R, W>(
         loop {
             let read_res = tokio::select! {
                 _ = cancel_token_up.cancelled() => break,
-                _ = cancel_up.notified() => break,
-                r = tokio::time::timeout(BRIDGE_READ_TIMEOUT, conn_read.read(&mut buf)) => r,
+                _ = cancel_up.cancelled() => break,
+                r = tokio::time::timeout(BRIDGE_CLIENT_IDLE_TIMEOUT, conn_read.read(&mut buf)) => r,
             };
             let n = match read_res {
                 Ok(Ok(0)) => {
@@ -917,7 +920,7 @@ pub async fn bridge_ws<R, W>(
                 break;
             }
         }
-        cancel_up.notify_waiters();
+        cancel_up.cancel();
     });
 
     // down: ws -> client
@@ -935,7 +938,7 @@ pub async fn bridge_ws<R, W>(
         loop {
             let recv_res = tokio::select! {
                 _ = cancel_token_down.cancelled() => break,
-                _ = cancel_down.notified() => break,
+                _ = cancel_down.cancelled() => break,
                 r = ws_down.recv_with_timeout(BRIDGE_READ_TIMEOUT) => r,
             };
             let mut data = match recv_res {
@@ -967,12 +970,12 @@ pub async fn bridge_ws<R, W>(
                 break;
             }
         }
-        cancel_down.notify_waiters();
+        cancel_down.cancel();
     });
 
     let _ = up_task.await;
     let _ = down_task.await;
-    cancel.notify_waiters();
+    cancel.cancel();
     ping_task.abort();
 
     let close_reason = {
@@ -1060,7 +1063,7 @@ pub async fn bridge_tcp<CR, CW>(
     let tg_enc = Arc::new(Mutex::new(tg_enc));
     let tg_dec = Arc::new(Mutex::new(tg_dec));
 
-    let cancel = Arc::new(tokio::sync::Notify::new());
+    let cancel = cancel_token.child_token();
 
     let cancel_up = cancel.clone();
     let cancel_token_up = cancel_token.clone();
@@ -1071,8 +1074,8 @@ pub async fn bridge_tcp<CR, CW>(
         loop {
             let n = tokio::select! {
                 _ = cancel_token_up.cancelled() => break,
-                _ = cancel_up.notified() => break,
-                r = tokio::time::timeout(BRIDGE_READ_TIMEOUT, c_read.read(&mut buf)) => match r {
+                _ = cancel_up.cancelled() => break,
+                r = tokio::time::timeout(BRIDGE_CLIENT_IDLE_TIMEOUT, c_read.read(&mut buf)) => match r {
                     Ok(Ok(0)) => break,
                     Ok(Ok(n)) => n,
                     _ => break,
@@ -1086,7 +1089,7 @@ pub async fn bridge_tcp<CR, CW>(
                 break;
             }
         }
-        cancel_up.notify_waiters();
+        cancel_up.cancel();
     };
 
     let cancel_down = cancel.clone();
@@ -1098,7 +1101,7 @@ pub async fn bridge_tcp<CR, CW>(
         loop {
             let n = tokio::select! {
                 _ = cancel_token_down.cancelled() => break,
-                _ = cancel_down.notified() => break,
+                _ = cancel_down.cancelled() => break,
                 r = tokio::time::timeout(BRIDGE_READ_TIMEOUT, r_read.read(&mut buf)) => match r {
                     Ok(Ok(0)) => break,
                     Ok(Ok(n)) => n,
@@ -1113,7 +1116,7 @@ pub async fn bridge_tcp<CR, CW>(
                 break;
             }
         }
-        cancel_down.notify_waiters();
+        cancel_down.cancel();
     };
 
     tokio::join!(up, down);
@@ -1147,52 +1150,62 @@ pub async fn bridge_tcp_stream(
 // TCP fallback — порт bridge._tcp_fallback
 // ---------------------------------------------------------------------------
 
-pub async fn tcp_fallback<R, W>(
-    conn_read: R,
-    conn_write: W,
-    dst: &str,
-    port: u16,
-    init: &[u8],
-    label: String,
-    ctx_streams: (TrackedStream, TrackedStream, TrackedStream, TrackedStream),
-    cancel_token: CancellationToken,
-) -> bool
-where
-    R: AsyncReadExt + Unpin + Send + 'static,
-    W: AsyncWriteExt + Unpin + Send + 'static,
-{
-    let addr = format!("{}:{}", dst, port);
-    let mut remote =
-        match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr)).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                lwarn!("[{}] TCP fallback to {}:{} failed: {}", label, dst, port, e);
-                return false;
-            }
-            Err(_) => {
-                lwarn!("[{}] TCP fallback to {}:{} failed: timeout", label, dst, port);
-                return false;
-            }
-        };
-    let _ = remote.set_nodelay(true);
+// Backoff как в bridge._tcp_fallback апстрима: заблокированный по IP DC не
+// должен съедать TCP_CONNECT_TIMEOUT на каждом новом коннекте перед CF.
+static TCP_BACKOFF: once_cell::sync::Lazy<parking_lot::Mutex<HashMap<String, (u32, f64)>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
 
-    STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
-    if remote.write_all(init).await.is_err() {
-        return false;
+pub fn reset_tcp_backoff() {
+    TCP_BACKOFF.lock().clear();
+}
+
+fn tcp_backoff_active(key: &str) -> bool {
+    TCP_BACKOFF
+        .lock()
+        .get(key)
+        .map(|(_, until)| now_monotonic() < *until)
+        .unwrap_or(false)
+}
+
+fn tcp_backoff_fail(key: &str) -> f64 {
+    let mut map = TCP_BACKOFF.lock();
+    let failures = map.get(key).map(|(c, _)| *c).unwrap_or(0) + 1;
+    let delay = (TCP_BACKOFF_INITIAL * 2f64.powi((failures - 1).min(7) as i32)).min(TCP_BACKOFF_MAX);
+    map.insert(key.to_string(), (failures, now_monotonic() + delay));
+    delay
+}
+
+// Только устанавливает TCP и шлёт init, НЕ трогая conn — при провале те же
+// halves уходят дальше в CF.
+async fn tcp_connect_fallback(dst: &str, port: u16, init: &[u8], label: &str) -> Option<TcpStream> {
+    let addr = format!("{}:{}", dst, port);
+    if tcp_backoff_active(&addr) {
+        ldebug!("[{}] TCP fallback to {} skipped (backoff)", label, addr);
+        return None;
     }
-    let (clt_dec, clt_enc, tg_enc, tg_dec) = ctx_streams;
-    bridge_tcp(
-        conn_read,
-        conn_write,
-        remote,
-        clt_dec,
-        clt_enc,
-        tg_enc,
-        tg_dec,
-        cancel_token,
-    )
+    let res = tokio::time::timeout(TCP_CONNECT_TIMEOUT, async {
+        let mut remote = TcpStream::connect(&addr).await?;
+        let _ = remote.set_nodelay(true);
+        remote.write_all(init).await?;
+        Ok::<_, std::io::Error>(remote)
+    })
     .await;
-    true
+    match res {
+        Ok(Ok(remote)) => {
+            TCP_BACKOFF.lock().remove(&addr);
+            Some(remote)
+        }
+        Ok(Err(e)) => {
+            let delay = tcp_backoff_fail(&addr);
+            lwarn!("[{}] TCP fallback to {} failed: {}; retry in {:.0}s", label, addr, e, delay);
+            None
+        }
+        Err(_) => {
+            let delay = tcp_backoff_fail(&addr);
+            lwarn!("[{}] TCP fallback to {} failed: timeout; retry in {:.0}s", label, addr, delay);
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1372,7 +1385,33 @@ where
     let secure_port = if DISABLE_SECURE.load(Ordering::Relaxed) { 80 } else { 443 };
     let use_worker = !worker_domains.is_empty() && !fallback_dst.is_empty() && !is_test;
 
-    // Шаг 1: worker-ws (без halves) — порт _cfproxy_worker_fallback.
+    // Шаг 1: tcp. В РФ CF режется ТСПУ (обрыв после ~16KB), поэтому в отличие
+    // от апстрима (worker -> cf -> tcp) прямой TCP пробуем раньше CF.
+    if !fallback_dst.is_empty() {
+        linfo!(
+            "[{}] DC{}{} -> TCP fallback to {}:{}",
+            label, dc, m_tag, fallback_dst, secure_port
+        );
+        if let Some(remote) =
+            tcp_connect_fallback(&fallback_dst, secure_port, relay_init, &label).await
+        {
+            STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
+            bridge_tcp(
+                conn_read,
+                conn_write,
+                remote,
+                clt_dec.clone_state(),
+                clt_enc.clone_state(),
+                tg_enc.clone_state(),
+                tg_dec.clone_state(),
+                cancel_token,
+            )
+            .await;
+            return true;
+        }
+    }
+
+    // Шаг 2: worker-ws (без halves) — порт _cfproxy_worker_fallback.
     if use_worker {
         let pooled = pools
             .cf_worker
@@ -1440,11 +1479,11 @@ where
                 return true;
             }
             ws.close().await;
-            // send failed — падаем сквозь к CF/TCP на тех же halves.
+            // send failed — падаем сквозь к CF на тех же halves.
         }
     }
 
-    // Шаг 2: cf-ws (без halves).
+    // Шаг 3: cf-ws (без halves).
     if use_cf {
         if let Some((ws, _chosen_domain)) =
             cfproxy_acquire_ws(dc, is_media, ws_path, &cancel_token).await
@@ -1471,33 +1510,7 @@ where
                 return true;
             }
             ws.close().await;
-            // CF умер сразу после хендшейка — пробуем TCP на том же conn.
         }
-        // CF не дал ws — halves НЕ тронуты, идём в TCP fallback ниже.
-    }
-
-    // Шаг 3: tcp.
-    if !fallback_dst.is_empty() {
-        linfo!(
-            "[{}] DC{}{} -> TCP fallback to {}:{}",
-            label, dc, m_tag, fallback_dst, secure_port
-        );
-        return tcp_fallback(
-            conn_read,
-            conn_write,
-            &fallback_dst,
-            secure_port,
-            relay_init,
-            label,
-            (
-                clt_dec.clone_state(),
-                clt_enc.clone_state(),
-                tg_enc.clone_state(),
-                tg_dec.clone_state(),
-            ),
-            cancel_token,
-        )
-        .await;
     }
 
     false
@@ -1868,11 +1881,25 @@ async fn serve_core<R, W>(
         }
     }
 
+    // Пул уже выяснил, что работает только fronting — не тратим ws_timeout на
+    // заведомо режущийся прямой SNI.
+    if ws_opt.is_none() && !is_test_dc && ws_pool_fronting_first() {
+        if let Some(d) = domains.first() {
+            ws_opt = connect_fronted(&target, d, ws_path).await;
+            if ws_opt.is_some() {
+                all_redirects = false;
+                linfo!("[{}] DC{}{} -> fronted wss://{} via {}", label, dc, m_tag, d, target);
+            }
+        }
+    }
+
     if ws_opt.is_none() {
         for domain in &domains {
             let url = format!("wss://{}{} via {}", domain, ws_path, target);
             linfo!("[{}] DC{}{} -> {}", label, dc, m_tag, url);
-            match ws_connect_full_opts(&target, domain, ws_path, ws_timeout, None, None).await {
+            // Some(true): DISABLE_SECURE (порт 80) относится только к CF. Без этого
+            // прямой WS к Telegram шёл plain HTTP с Host: kwsN.web.telegram.org.
+            match ws_connect_full_opts(&target, domain, ws_path, ws_timeout, None, Some(true)).await {
                 Ok(ws) => {
                     all_redirects = false;
                     ws_opt = Some(ws);
@@ -1903,11 +1930,21 @@ async fn serve_core<R, W>(
                 }
                 Err(WsError::Timeout) => {
                     STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
-                    ws_timed_out = true;
                     lwarn!(
                         "[{}] DC{}{} WS connect timed out via {}",
                         label, dc, m_tag, domain
                     );
+                    // Таймаут на прямом SNI в РФ обычно = DPI; пробуем fronting
+                    // так же, как pool::_connect_one.
+                    if !is_test_dc && !ws_pool_fronting_first() {
+                        if let Some(ws) = connect_fronted(&target, domain, ws_path).await {
+                            all_redirects = false;
+                            linfo!("[{}] DC{}{} -> fronted wss://{} via {}", label, dc, m_tag, domain, target);
+                            ws_opt = Some(ws);
+                            break;
+                        }
+                    }
+                    ws_timed_out = true;
                     break;
                 }
                 Err(exc) => {
@@ -2093,7 +2130,7 @@ pub async fn connect_direct_ws(
     let mut all_redirects = true;
 
     for dom in domains {
-        match ws_connect_full_opts(target, dom, ws_path, timeout, None, None).await {
+        match ws_connect_full_opts(target, dom, ws_path, timeout, None, Some(true)).await {
             Ok(ws) => return (Some(ws), ws_failed_redirect, false),
             Err(WsError::Handshake(h)) => {
                 STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
