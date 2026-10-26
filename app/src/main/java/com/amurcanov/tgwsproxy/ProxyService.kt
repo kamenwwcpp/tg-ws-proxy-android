@@ -16,6 +16,7 @@ import android.os.PowerManager
 import android.util.Log
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -262,7 +263,7 @@ class ProxyService : Service() {
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_SCREEN_OFF)
         }
-        registerReceiver(receiver, filter)
+        ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         screenReceiver = receiver
     }
 
@@ -310,16 +311,20 @@ class ProxyService : Service() {
             updateRunningState(false)
             delay(350.milliseconds)
 
-            startProxy(
-                bindIp = lastBindIp,
-                port = lastPort,
-                ips = lastIps,
-                poolSize = lastPoolSize,
-                cfEnabled = lastCfEnabled,
-                cfPriority = lastCfPriority,
-                cfDomain = lastCfDomain,
-                secretKey = lastSecretKey
-            )
+            // startProxy меняет statsJob/screenReceiver — держим это на main,
+            // где их же трогает screen-receiver и onStartCommand.
+            withContext(Dispatchers.Main) {
+                startProxy(
+                    bindIp = lastBindIp,
+                    port = lastPort,
+                    ips = lastIps,
+                    poolSize = lastPoolSize,
+                    cfEnabled = lastCfEnabled,
+                    cfPriority = lastCfPriority,
+                    cfDomain = lastCfDomain,
+                    secretKey = lastSecretKey
+                )
+            }
         }
     }
 

@@ -176,7 +176,7 @@ pub extern "C" fn StopProxy() -> c_int {
     IP_FAIL_UNTIL.write().clear();
     proxy::reset_tcp_backoff();
     cfproxy::clear_cfproxy_429_cooldowns();
-    proxy::set_ws_pool_fronting_first(true);
+    proxy::set_ws_pool_fronting_first(false);
 
     linfo!("StopProxy: exit");
     0

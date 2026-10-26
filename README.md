@@ -5,13 +5,33 @@
   <img src="https://img.shields.io/badge/Android-SDK_24--36-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android SDK">
   <img src="https://img.shields.io/badge/Rust-1.70+-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust Version">
   <img src="https://img.shields.io/badge/Kotlin-Native-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white" alt="Kotlin">
-  <a href="https://github.com/amurcanov/tg-ws-proxy-android/stargazers">
-    <img src="https://img.shields.io/github/stars/amurcanov/tg-ws-proxy-android?style=for-the-badge&logo=github&color=ffca28&labelColor=24292e" alt="Stars">
+  <a href="https://github.com/kamenwwcpp/tg-ws-proxy-android/stargazers">
+    <img src="https://img.shields.io/github/stars/kamenwwcpp/tg-ws-proxy-android?style=for-the-badge&logo=github&color=ffca28&labelColor=24292e" alt="Stars">
   </a>
 </div>
 <br>
 
+> [!IMPORTANT]
+> Это продолжение **[amurcanov/tg-ws-proxy-android](https://github.com/amurcanov/tg-ws-proxy-android)** (автор Android-версии — [amurcanov](https://github.com/amurcanov)), которое в свою очередь основано на **[Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy)**. Вся история коммитов оригинала сохранена. Здесь — фиксы стабильности для сетей РФ и расхода батареи.
+
 **TG WS Proxy Android** — это локальный **MTProto-прокси** для Telegram на Android. Приложение помогает частично решать проблемы и в ряде сценариев ускоряет работу мессенджера, перенаправляя трафик через защищённые CloudFlare WebSocket-соединения или напрямую к датацентрам Telegram.
+
+---
+
+## Что изменено относительно оригинала (v1.3.0)
+
+**Стабильность**
+- Режим «Авто» больше не гонит весь трафик через CloudFlare: прокси идёт напрямую на Telegram через WebSocket (DC2/DC4 → `149.154.167.220`, как в Windows-версии). CF в РФ режется ТСПУ, поэтому он теперь последний вариант.
+- Прямой WebSocket к Telegram всегда идёт по TLS. Раньше из-за настройки «порт 80 для CF» он уходил открытым HTTP, и DPI видел домен `kwsN.web.telegram.org`.
+- Fronting (SNI `sprinthost.ru`) на прямом пути, если прямое подключение по таймауту не прошло, как в пуле апстрима.
+- Порядок fallback: **WS → TCP → CF**. Для TCP короткий таймаут и backoff, чтобы заблокированный IP не тормозил каждое новое подключение.
+- Исправлено зависание полумёртвых соединений: сигнал остановки моста мог теряться.
+
+**Батарея**
+- Убран постоянный `WAKE_LOCK`, из-за которого процессор телефона не засыпал никогда.
+- Статистика в уведомлении обновляется только при включённом экране.
+- Чтение логов работает только пока приложение открыто (раньше logcat читался в фоне всегда).
+- Прокси больше не рвёт простаивающие соединения Telegram через 2 минуты. Keepalive-ping отправляется только после 2 минут тишины, а не каждые 30 секунд.
 
 ---
 
@@ -42,7 +62,7 @@ Telegram Android → Локальный MTProto (по умолчанию 127.0.0
 
 ## Быстрый старт
 
-1. Скачайте актуальный `APK` со **[страницы релизов](https://github.com/amurcanov/tg-ws-proxy-android/releases)**.
+1. Скачайте актуальный `APK` со **[страницы релизов](https://github.com/kamenwwcpp/tg-ws-proxy-android/releases)**.
 2. Установите приложение на ваш Android-смартфон.
 3. Откройте **TG WS Proxy Android**.
 4. Ознакомьтесь со справкой внутри приложения.
@@ -79,4 +99,4 @@ Telegram Android → Локальный MTProto (по умолчанию 127.0.0
 
 ## Лицензия
 
-Этот форк распространяется под лицензией **GPLv3**. Оригинальный код `tg-ws-proxy` от [Flowseal](https://github.com/Flowseal) доступен под лицензией **MIT**.
+Проект распространяется под лицензией **GPLv3**, как и Android-версия [amurcanov](https://github.com/amurcanov/tg-ws-proxy-android), на которой он основан. Оригинальный код `tg-ws-proxy` от [Flowseal](https://github.com/Flowseal) доступен под лицензией **MIT**.

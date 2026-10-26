@@ -597,6 +597,10 @@ object LogManager {
     private var job: Job? = null
     private var logcatProcess: Process? = null
     private val nextKey = AtomicLong(0)
+    // Ридер перезапускается на каждый onStart; без -T logcat перечитывал бы
+    // весь буфер процесса и дублировал уже показанные строки.
+    @Volatile
+    private var resumeFromEpochMs = 0L
 
     // Buffered channel — absorbs bursts of log lines without blocking the reader
     private val logChannel = Channel<LogEntry>(capacity = BUFFERED)
@@ -608,7 +612,12 @@ object LogManager {
             val readerJob = launch(Dispatchers.IO) {
                 try {
                     val pid = android.os.Process.myPid()
-                    val process = ProcessBuilder("logcat", "-v", "tag", "--pid", pid.toString())
+                    val cmd = mutableListOf("logcat", "-v", "tag", "--pid", pid.toString())
+                    val since = resumeFromEpochMs
+                    if (since > 0L) {
+                        cmd += listOf("-T", "%d.%03d".format(since / 1000, since % 1000))
+                    }
+                    val process = ProcessBuilder(cmd)
                         .redirectErrorStream(true)
                         .start()
                         
@@ -684,6 +693,7 @@ object LogManager {
     }
 
     fun stopListening() {
+        if (job != null) resumeFromEpochMs = System.currentTimeMillis()
         job?.cancel()
         job = null
         logcatProcess?.destroy()

@@ -17,10 +17,11 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 // ---------------------------------------------------------------------------
-// Fronting flag — proxy/pool.py::_WsPool.try_fronting_first (начинается true)
+// Fronting flag — proxy/pool.py::_WsPool.try_fronting_first. Апстрим (50c980e)
+// стартует с False: иначе каждый коннект сперва ждёт fronting-таймаут.
 // ---------------------------------------------------------------------------
 
-static TRY_FRONTING_FIRST: AtomicBool = AtomicBool::new(true);
+static TRY_FRONTING_FIRST: AtomicBool = AtomicBool::new(false);
 
 pub fn ws_pool_fronting_first() -> bool {
     TRY_FRONTING_FIRST.load(Ordering::Relaxed)
@@ -469,7 +470,7 @@ impl WsPool {
         self.slots.lock().await.clear();
         self.rotating.lock().await.clear();
         self.refill_failures.lock().await.clear();
-        set_ws_pool_fronting_first(true);
+        set_ws_pool_fronting_first(false);
     }
 }
 
