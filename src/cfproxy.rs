@@ -297,7 +297,12 @@ pub fn init_cfproxy_domains() {
     }
 }
 
-pub fn start_cfproxy_refresh() {
+// Привязан к cancel-токену сессии: рантайм глобальный и не дропается, поэтому
+// раньше каждый StartProxy оставлял ещё один вечный часовой цикл.
+pub fn start_cfproxy_refresh(cancel: tokio_util::sync::CancellationToken) {
+    if !CFPROXY_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     // Порт proxy/config.py::start_cfproxy_domain_refresh: сначала пробуем
     // обновить сразу (до 3 попыток), затем раз в час фоновым таском.
     // На мобиле уважаем свежесть дискового кеша для первой попытки.
@@ -305,20 +310,26 @@ pub fn start_cfproxy_refresh() {
         ldebug!(" CF: кеш свежий, откладываю обновление списка на час");
     }
     tokio::spawn(async move {
-        if should_refresh_cfproxy_domains() {
-            for _ in 0..3 {
-                if try_refresh_cfproxy_domains().await {
-                    break;
+        let work = async {
+            if should_refresh_cfproxy_domains() {
+                for _ in 0..3 {
+                    if try_refresh_cfproxy_domains().await {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(10)).await;
                 }
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                if CFPROXY.read().domains.is_empty() {
+                    ldebug!(" CF: обновить список доменов не удалось, остаюсь на кеше/встроенном списке");
+                }
             }
-            if CFPROXY.read().domains.is_empty() {
-                ldebug!(" CF: обновить список доменов не удалось, остаюсь на кеше/встроенном списке");
+            loop {
+                tokio::time::sleep(CFPROXY_REFRESH_INTERVAL).await;
+                try_refresh_cfproxy_domains().await;
             }
-        }
-        loop {
-            tokio::time::sleep(CFPROXY_REFRESH_INTERVAL).await;
-            try_refresh_cfproxy_domains().await;
+        };
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            _ = work => {}
         }
     });
 }

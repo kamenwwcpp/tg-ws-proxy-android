@@ -48,6 +48,7 @@ fun ConnectionTab(settingsStore: SettingsStore) {
     val context = LocalContext.current
     val isRunning by ProxyService.isRunning.collectAsStateWithLifecycle()
     val isVerifiedRunning by ProxyService.isVerifiedRunning.collectAsStateWithLifecycle()
+    val stateEpoch by ProxyService.stateEpoch.collectAsStateWithLifecycle()
 
     val isReady by settingsStore.isReady.collectAsStateWithLifecycle(initialValue = false)
 
@@ -89,7 +90,9 @@ fun ConnectionTab(settingsStore: SettingsStore) {
         else -> stringResource(R.string.status_disconnected)
     }
 
-    LaunchedEffect(isRunning, isVerifiedRunning) {
+    // stateEpoch: провалившийся старт не меняет isRunning, и без него кнопка
+    // залипала в «Подключение…».
+    LaunchedEffect(isRunning, isVerifiedRunning, stateEpoch) {
         if (isVerifiedRunning || !isRunning) {
             isStarting = false
         }

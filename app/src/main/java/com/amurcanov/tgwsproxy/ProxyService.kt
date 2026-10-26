@@ -10,6 +10,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -24,28 +26,38 @@ import kotlin.time.Duration.Companion.milliseconds
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
+import java.util.concurrent.Executors
 
 class ProxyService : Service() {
 
+    private class PortBusyException : Exception()
+
+    private data class ProxyConfig(
+        val bindIp: String,
+        val port: Int,
+        val ips: String,
+        val poolSize: Int,
+        val cfEnabled: Boolean,
+        val cfPriority: Boolean,
+        val cfDomain: String,
+        val secretKey: String,
+    )
+
     private var statsJob: Job? = null
     private var screenReceiver: BroadcastReceiver? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var restartJob: Job? = null
     private var lastNotificationContent: String = ""
     private var lastNotificationAtMs: Long = 0L
     private var notificationStartedAtMs: Long = 0L
-    @Volatile
-    private var stopInProgress = false
-    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
-    // Saved intent extras for restart on kill / onTaskRemoved
-    private var lastBindIp: String = "127.0.0.1"
-    private var lastPort: Int = 1443
-    private var lastIps: String = ""
-    private var lastPoolSize: Int = 4
-    private var lastCfEnabled: Boolean = true
-    private var lastCfPriority: Boolean = true
-    private var lastCfDomain: String = ""
-    private var lastSecretKey: String = ""
+    // Всё состояние ниже трогается только с main-потока.
+    private var startInProgress = false
+    private var stopInProgress = false
+    private var pendingStart: ProxyConfig? = null
+    private var lastConfig: ProxyConfig? = null
+
+    private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     companion object {
         const val ACTION_START = "com.amurcanov.tgwsproxy.START"
@@ -59,7 +71,7 @@ class ProxyService : Service() {
         const val EXTRA_CFPROXY_PRIORITY = "EXTRA_CFPROXY_PRIORITY"
         const val EXTRA_CFPROXY_DOMAIN = "EXTRA_CFPROXY_DOMAIN"
         const val EXTRA_SECRET_KEY = "EXTRA_SECRET_KEY"
-        
+
         private const val NOTIFICATION_ID = 101
         private const val CHANNEL_ID = "TG_WS_Proxy_Service_v4"
         private const val TAG = "ProxyService"
@@ -69,10 +81,23 @@ class ProxyService : Service() {
         private const val NOTIFICATION_MIN_UPDATE_MS = 5_000L
         private const val NATIVE_STOP_WAIT_MS = 3_000L
 
+        // Нативное состояние процессное и не потокобезопасно между Start/Stop:
+        // параллельные вызовы давали -1 на втором StartProxy (и авто-стоп рабочего
+        // прокси) или StopProxy раньше StartProxy (осиротевший прокси на порту).
+        private val nativeDispatcher = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "ProxyNative").apply { isDaemon = true }
+        }.asCoroutineDispatcher()
+        private val nativeScope = CoroutineScope(SupervisorJob() + nativeDispatcher)
+
         private val _isRunning = MutableStateFlow(false)
         val isRunning: StateFlow<Boolean> = _isRunning
         private val _isVerifiedRunning = MutableStateFlow(false)
         val isVerifiedRunning: StateFlow<Boolean> = _isVerifiedRunning
+
+        // Монотонный счётчик смен состояния: UI сбрасывает «Подключение…», даже если
+        // старт провалился и isRunning так и не менялся.
+        private val _stateEpoch = MutableStateFlow(0)
+        val stateEpoch: StateFlow<Int> = _stateEpoch
     }
 
     override fun onCreate() {
@@ -83,16 +108,25 @@ class ProxyService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START -> {
+                // Контракт startForegroundService: startForeground обязан прозвучать
+                // на каждый вызов, даже если старт отложен/не нужен.
+                if (!startForegroundSafe(getString(R.string.notification_starting))) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 LogManager.clearLogs()
-                val bindIp = intent.getStringExtra(EXTRA_BIND_IP) ?: "127.0.0.1"
-                val port = intent.getIntExtra(EXTRA_PORT, 1443)
-                val ips = intent.getStringExtra(EXTRA_IPS) ?: ""
-                val poolSize = intent.getIntExtra(EXTRA_POOL_SIZE, 4)
-                val cfEnabled = intent.getBooleanExtra(EXTRA_CFPROXY_ENABLED, true)
-                val cfPriority = intent.getBooleanExtra(EXTRA_CFPROXY_PRIORITY, true)
-                val cfDomain = intent.getStringExtra(EXTRA_CFPROXY_DOMAIN) ?: ""
-                val secretKey = intent.getStringExtra(EXTRA_SECRET_KEY) ?: ""
-                startProxy(bindIp, port, ips, poolSize, cfEnabled, cfPriority, cfDomain, secretKey)
+                startProxy(
+                    ProxyConfig(
+                        bindIp = intent.getStringExtra(EXTRA_BIND_IP) ?: "127.0.0.1",
+                        port = intent.getIntExtra(EXTRA_PORT, 1443),
+                        ips = intent.getStringExtra(EXTRA_IPS) ?: "",
+                        poolSize = intent.getIntExtra(EXTRA_POOL_SIZE, 4),
+                        cfEnabled = intent.getBooleanExtra(EXTRA_CFPROXY_ENABLED, true),
+                        cfPriority = intent.getBooleanExtra(EXTRA_CFPROXY_PRIORITY, true),
+                        cfDomain = intent.getStringExtra(EXTRA_CFPROXY_DOMAIN) ?: "",
+                        secretKey = intent.getStringExtra(EXTRA_SECRET_KEY) ?: "",
+                    )
+                )
             }
             ACTION_STOP -> {
                 stopProxy()
@@ -101,11 +135,11 @@ class ProxyService : Service() {
                 restartProxy()
             }
             null -> {
-                // Service restarted by system after being killed (START_REDELIVER_INTENT)
-                // If we had saved params, try to restart
-                if (lastPort > 0 && lastSecretKey.isNotEmpty()) {
+                // Service restarted by system after being killed
+                val cfg = lastConfig
+                if (cfg != null) {
                     Log.w(TAG, "Service restarted by system, re-starting proxy")
-                    startProxy(lastBindIp, lastPort, lastIps, lastPoolSize, lastCfEnabled, lastCfPriority, lastCfDomain, lastSecretKey)
+                    startProxy(cfg)
                 } else {
                     stopSelf()
                 }
@@ -116,6 +150,22 @@ class ProxyService : Service() {
         return START_REDELIVER_INTENT
     }
 
+    private fun startForegroundSafe(content: String): Boolean {
+        return try {
+            val notification = createNotification(content)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            true
+        } catch (e: Exception) {
+            // Android 12+: ForegroundServiceStartNotAllowedException при рестарте из фона.
+            Log.e(TAG, "startForeground failed", e)
+            false
+        }
+    }
+
     private fun isPortAvailable(bindIp: String, port: Int): Boolean {
         return try {
             ServerSocket().use { socket ->
@@ -124,97 +174,82 @@ class ProxyService : Service() {
                 true
             }
         } catch (_: Exception) {
-            // (Если надо, то тут может быть IOException или SecurityException) (IOException добавляет новый import так что "_", по-моему, лучше)
-            return false
+            false
         }
     }
 
-
-    private fun startProxy(bindIp: String, port: Int, ips: String, poolSize: Int = 4,
-                           cfEnabled: Boolean = true, cfPriority: Boolean = true,
-                           cfDomain: String = "", secretKey: String = "") {
-        if (_isRunning.value || stopInProgress) return
+    private fun startProxy(cfg: ProxyConfig) {
+        if (_isRunning.value || startInProgress) return
+        if (stopInProgress) {
+            // Стоп ещё идёт: стартуем сразу после него, а не теряем запрос.
+            pendingStart = cfg
+            return
+        }
+        startInProgress = true
         _isVerifiedRunning.value = false
+        lastConfig = cfg
 
-        // Save params for restart
-        lastBindIp = bindIp
-        lastPort = port
-        lastIps = ips
-        lastPoolSize = poolSize
-        lastCfEnabled = cfEnabled
-        lastCfPriority = cfPriority
-        lastCfDomain = cfDomain
-        lastSecretKey = secretKey
         notificationStartedAtMs = System.currentTimeMillis()
         lastNotificationContent = getString(R.string.notification_starting)
         lastNotificationAtMs = notificationStartedAtMs
-
-        val notification = createNotification(lastNotificationContent)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        if (!startForegroundSafe(lastNotificationContent)) {
+            startInProgress = false
+            updateRunningState(false)
+            stopSelf()
+            return
         }
 
         // Без WakeLock: FGS сохраняет сеть в Doze, а входящий пакет сам будит CPU.
         // Постоянный PARTIAL_WAKE_LOCK не давал процессору засыпать вообще.
-        stopInProgress = false
-        
-        // Start Go proxy in a separate thread with error handling
-        Thread({
-            val canObtainPort = isPortAvailable(bindIp, port)
-            if (!canObtainPort) {
-                val str = getString(R.string.port_is_not_available, port)
-                serviceScope.launch(Dispatchers.Main) {
+        registerScreenReceiver()
+        registerNetworkCallback()
+        if ((getSystemService(POWER_SERVICE) as PowerManager).isInteractive) {
+            startStatsUpdates()
+        }
+
+        serviceScope.launch {
+            val result: Result<Int> = withContext(nativeDispatcher) {
+                if (!isPortAvailable(cfg.bindIp, cfg.port)) {
+                    return@withContext Result.failure(PortBusyException())
+                }
+                runCatching {
+                    NativeProxy.setPoolSize(cfg.poolSize)
+                    NativeProxy.setCfProxyCacheDir(cacheDir.absolutePath)
+                    NativeProxy.setCfProxyConfig(cfg.cfEnabled, cfg.cfPriority, cfg.cfDomain)
+                    NativeProxy.startProxy(cfg.bindIp, cfg.port, cfg.ips, cfg.secretKey, 1)
+                }
+            }
+            startInProgress = false
+            if (stopInProgress) return@launch
+
+            val code = result.getOrNull()
+            val error = result.exceptionOrNull()
+            when {
+                code == 0 -> {
+                    updateRunningState(true)
+                    _isVerifiedRunning.value = true
+                    updateNotification(getString(R.string.notification_running), force = true)
+                    Log.i(TAG, "Proxy ready: listening on port ${cfg.port}")
+                }
+                error is PortBusyException -> {
+                    val str = getString(R.string.port_is_not_available, cfg.port)
                     Toast.makeText(this@ProxyService, str, Toast.LENGTH_SHORT).show()
                     updateNotification(str, force = true)
                     stopProxy()
                 }
-                return@Thread
-            }
-
-            try {
-                NativeProxy.setPoolSize(poolSize)
-                NativeProxy.setCfProxyCacheDir(cacheDir.absolutePath)
-                NativeProxy.setCfProxyConfig(cfEnabled, cfPriority, cfDomain)
-                val result = NativeProxy.startProxy(bindIp, port, ips, secretKey, 1)
-                if (result == 0) {
-                    serviceScope.launch {
-                        if (!stopInProgress) {
-                            updateRunningState(true)
-                            _isVerifiedRunning.value = true
-                            updateNotification(getString(R.string.notification_running), force = true)
-                            Log.i(TAG, "Proxy ready: listening on port $port")
-                        }
-                    }
-                } else {
-                    Log.e(TAG, "StartProxy returned error code: $result")
-                    serviceScope.launch {
-                        updateNotification(getString(R.string.notification_start_error_code, result), force = true)
-                        delay(3000.milliseconds)
-                        stopProxy()
-                    }
+                error != null -> {
+                    Log.e(TAG, "Failed to start proxy via JNA", error)
+                    updateNotification(getString(R.string.notification_error, error.message ?: ""), force = true)
+                    delay(3000.milliseconds)
+                    stopProxy()
                 }
-            } catch (e: Throwable) {
-                Log.e(TAG, "Failed to start proxy via JNA", e)
-                serviceScope.launch {
-                    updateNotification(getString(R.string.notification_error, e.message ?: ""), force = true)
+                else -> {
+                    Log.e(TAG, "StartProxy returned error code: $code")
+                    updateNotification(getString(R.string.notification_start_error_code, code ?: -1), force = true)
                     delay(3000.milliseconds)
                     stopProxy()
                 }
             }
-        }, "ProxyStart").apply {
-            isDaemon = true
-            start()
-        }
-
-        registerScreenReceiver()
-        if ((getSystemService(POWER_SERVICE) as PowerManager).isInteractive) {
-            startStatsUpdates()
         }
     }
 
@@ -225,7 +260,7 @@ class ProxyService : Service() {
                 delay(STATS_UPDATE_MS.milliseconds)
                 if (_isRunning.value && !stopInProgress) {
                     try {
-                        val rawStats = NativeProxy.getStats() ?: continue
+                        val rawStats = withContext(Dispatchers.IO) { NativeProxy.getStats() } ?: continue
                         val upRaw = extractStat(rawStats, "up=")
                         val downRaw = extractStat(rawStats, "down=")
                         val activeConns = extractStat(rawStats, "active=")
@@ -254,7 +289,7 @@ class ProxyService : Service() {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 when (intent.action) {
-                    Intent.ACTION_SCREEN_ON -> if (_isRunning.value && !stopInProgress) startStatsUpdates()
+                    Intent.ACTION_SCREEN_ON -> if (!stopInProgress && (_isRunning.value || startInProgress)) startStatsUpdates()
                     Intent.ACTION_SCREEN_OFF -> stopStatsUpdates()
                 }
             }
@@ -277,6 +312,47 @@ class ProxyService : Service() {
         screenReceiver = null
     }
 
+    // Wi-Fi <-> LTE: сокеты пула от старой сети молча мертвы, а cooldown'ы
+    // посчитаны для другого маршрута — без сброса TG минуту получал дохлые коннекты.
+    private fun registerNetworkCallback() {
+        if (networkCallback != null || Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
+        val cm = getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            @Volatile
+            private var current: Network? = null
+
+            override fun onAvailable(network: Network) {
+                val prev = current
+                current = network
+                // Первый onAvailable прилетает сразу при регистрации — это не смена.
+                if (prev != null && prev != network) {
+                    nativeScope.launch {
+                        try {
+                            NativeProxy.networkChanged()
+                        } catch (e: Throwable) {
+                            Log.w(TAG, "NetworkChanged failed", e)
+                        }
+                    }
+                }
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(callback)
+            networkCallback = callback
+        } catch (e: Exception) {
+            Log.w(TAG, "registerDefaultNetworkCallback failed", e)
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        val cb = networkCallback ?: return
+        networkCallback = null
+        try {
+            (getSystemService(CONNECTIVITY_SERVICE) as? ConnectivityManager)?.unregisterNetworkCallback(cb)
+        } catch (_: Exception) {
+        }
+    }
+
     private fun updateNotification(content: String, force: Boolean = false) {
         val now = System.currentTimeMillis()
         if (!force) {
@@ -295,8 +371,9 @@ class ProxyService : Service() {
     }
 
     private fun restartProxy() {
-        if (restartJob?.isActive == true) return
-        if (lastPort <= 0 || lastSecretKey.isEmpty()) {
+        if (restartJob?.isActive == true || stopInProgress || startInProgress) return
+        val cfg = lastConfig
+        if (cfg == null) {
             Log.w(TAG, "Restart requested without saved proxy configuration")
             return
         }
@@ -305,26 +382,10 @@ class ProxyService : Service() {
             Log.i(TAG, "Restarting proxy from notification")
             updateNotification(getString(R.string.notification_restarting), force = true)
 
-            stopStatsUpdates()
-
             requestNativeStop("restart")
             updateRunningState(false)
             delay(350.milliseconds)
-
-            // startProxy меняет statsJob/screenReceiver — держим это на main,
-            // где их же трогает screen-receiver и onStartCommand.
-            withContext(Dispatchers.Main) {
-                startProxy(
-                    bindIp = lastBindIp,
-                    port = lastPort,
-                    ips = lastIps,
-                    poolSize = lastPoolSize,
-                    cfEnabled = lastCfEnabled,
-                    cfPriority = lastCfPriority,
-                    cfDomain = lastCfDomain,
-                    secretKey = lastSecretKey
-                )
-            }
+            startProxy(cfg)
         }
     }
 
@@ -335,7 +396,7 @@ class ProxyService : Service() {
         val end = stats.indexOf(" ", start)
         return if (end == -1) stats.substring(start) else stats.substring(start, end)
     }
-    
+
     private fun parseHumanBytes(s: String): Double {
         val num = s.replace(Regex("[^0-9.]"), "").toDoubleOrNull() ?: 0.0
         return when {
@@ -346,7 +407,7 @@ class ProxyService : Service() {
             else -> num
         }
     }
-    
+
     private fun formatBytes(bytes: Double): String {
         if (bytes < 1024) return "%.0fB".format(bytes)
         if (bytes < 1024 * 1024) return "%.1fKB".format(bytes / 1024)
@@ -357,14 +418,25 @@ class ProxyService : Service() {
     private fun stopProxy() {
         if (stopInProgress) return
         stopInProgress = true
+        pendingStart = null
         restartJob?.cancel()
         restartJob = null
         stopStatsUpdates()
         unregisterScreenReceiver()
+        unregisterNetworkCallback()
         serviceScope.launch {
             updateNotification(getString(R.string.notification_stopping), force = true)
+            // nativeScope последовательный: стоп гарантированно после идущего старта.
             requestNativeStop("stop")
             updateRunningState(false)
+            stopInProgress = false
+
+            val pending = pendingStart
+            pendingStart = null
+            if (pending != null) {
+                startProxy(pending)
+                return@launch
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                 stopForeground(STOP_FOREGROUND_REMOVE)
             } else {
@@ -376,22 +448,17 @@ class ProxyService : Service() {
     }
 
     private suspend fun requestNativeStop(reason: String): Boolean {
-        val completed = CompletableDeferred<Unit>()
-        Thread({
+        val job = nativeScope.async {
             try {
                 NativeProxy.stopProxy()
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.w(TAG, "StopProxy failed during $reason", e)
-            } finally {
-                completed.complete(Unit)
             }
-        }, "ProxyStop-$reason").apply {
-            isDaemon = true
-            start()
         }
-
+        // await, а не withContext: блокирующий JNI-вызов нельзя прервать, но ждать
+        // его дольше таймаута UI не обязан.
         val finished = withTimeoutOrNull(NATIVE_STOP_WAIT_MS.milliseconds) {
-            completed.await()
+            job.await()
             true
         } ?: false
 
@@ -410,7 +477,6 @@ class ProxyService : Service() {
         if (_isRunning.value) {
             Log.w(TAG, "onTaskRemoved: proxy is running, service stays alive")
             // The service continues because stopWithTask=false in manifest
-            // No action needed — the service keeps running.
         }
     }
 
@@ -419,6 +485,7 @@ class ProxyService : Service() {
         if (!isRunning) {
             _isVerifiedRunning.value = false
         }
+        _stateEpoch.value += 1
         ProxyTileService.requestSync(this)
     }
 
@@ -487,6 +554,17 @@ class ProxyService : Service() {
         restartJob = null
         stopStatsUpdates()
         unregisterScreenReceiver()
+        unregisterNetworkCallback()
+        // Сервис уничтожен не через stopProxy (система/FGS-лимит) — гасим ядро,
+        // иначе оно держит порт и следующий старт падает с «порт занят».
+        if (!stopInProgress && (_isRunning.value || startInProgress)) {
+            nativeScope.launch {
+                try {
+                    NativeProxy.stopProxy()
+                } catch (_: Throwable) {
+                }
+            }
+        }
         if (_isRunning.value) {
             updateRunningState(false)
         }

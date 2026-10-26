@@ -200,6 +200,36 @@ impl RawWebSocket {
         self.closed.load(Ordering::Relaxed)
     }
 
+    /// Неблокирующая проверка простаивающего (пулового) WS: сервер закрыл его
+    /// (EOF / OP_CLOSE / ошибка) — аналог reader.at_eof() в pool._is_stale апстрима.
+    /// Без этого после смены сети/таймаута сервера пул отдавал мёртвые сокеты.
+    /// Данные не потребляются: poll_fill_buf оставляет их в буфере BufReader.
+    pub fn peer_closed(&self) -> bool {
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+        use tokio::io::AsyncBufRead;
+        if self.is_closed() {
+            return true;
+        }
+        let Ok(mut guard) = self.reader.try_lock() else {
+            return false;
+        };
+        let mut cx = Context::from_waker(Waker::noop());
+        let res = match &mut *guard {
+            WsReader::Tls(r) => Pin::new(r).poll_fill_buf(&mut cx).map_ok(|b| b.first().copied()),
+            WsReader::Plain(r) => Pin::new(r).poll_fill_buf(&mut cx).map_ok(|b| b.first().copied()),
+        };
+        let dead = match res {
+            Poll::Pending => false,
+            Poll::Ready(Ok(None)) | Poll::Ready(Err(_)) => true,
+            Poll::Ready(Ok(Some(b0))) => (b0 & 0x0F) == OP_CLOSE,
+        };
+        if dead {
+            self.closed.store(true, Ordering::Relaxed);
+        }
+        dead
+    }
+
     /// Совместимость: закрыт ли транспорт (аналог writer.transport.is_closing()).
     pub fn transport_closing(&self) -> bool {
         self.is_closed()
@@ -575,9 +605,10 @@ fn set_sock_opts(stream: &TcpStream) {
     if TCP_NODELAY {
         let _ = stream.set_nodelay(true);
     }
-    // Аналог Go/Python: keepalive 30s — детект мёртвых соединений на мобиле.
+    // Апстрим keepalive не ставит вовсе. 30s будило радио на каждом простаивающем
+    // сокете пула; мёртвый линк и так ловят WS-ping и пинги самого Telegram.
     let sock = socket2::SockRef::from(stream);
-    let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(30));
+    let ka = socket2::TcpKeepalive::new().with_time(Duration::from_secs(240));
     let _ = sock.set_tcp_keepalive(&ka);
     // proxy/raw_websocket.py::set_sock_opts — buffer_size из конфига.
     let buf = BUFFER_SIZE.load(std::sync::atomic::Ordering::Relaxed);
@@ -593,16 +624,6 @@ pub fn ws_connect_timeout(timeout: f64) -> Duration {
         Duration::from_secs(5)
     } else {
         Duration::from_secs_f64(timeout)
-    }
-}
-
-pub fn ws_handshake_timeout(total: Duration) -> Duration {
-    if total <= Duration::ZERO {
-        Duration::from_secs(3)
-    } else if total > Duration::from_secs(3) {
-        Duration::from_secs(3)
-    } else {
-        total
     }
 }
 
@@ -794,7 +815,9 @@ pub async fn ws_connect_once_full(
         format!("{}:80", dial_addr)
     };
 
-    let raw_conn = match tokio::time::timeout(timeout, TcpStream::connect(&target_addr)).await {
+    // TCP + TLS под одним дедлайном min(timeout, 10), как open_connection в апстриме.
+    let deadline = tokio::time::Instant::now() + timeout.min(Duration::from_secs(10));
+    let raw_conn = match tokio::time::timeout_at(deadline, TcpStream::connect(&target_addr)).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => return Err(WsError::Io(e)),
         Err(_) => return Err(WsError::Timeout),
@@ -816,9 +839,10 @@ pub async fn ws_connect_once_full(
     let connector = TlsConnector::from(cfg);
     let sni_server = server_name(sni_name);
 
-    let handshake_timeout = ws_handshake_timeout(timeout);
+    // Раньше TLS резался фиксированными 3s: на LTE с большим RTT за DPI хендшейк
+    // не успевал, WS считался таймаутом и IP уходил в cooldown.
     let tls_conn =
-        match tokio::time::timeout(handshake_timeout, connector.connect(sni_server, raw_conn)).await {
+        match tokio::time::timeout_at(deadline, connector.connect(sni_server, raw_conn)).await {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
                 if e.kind() != std::io::ErrorKind::ConnectionReset {

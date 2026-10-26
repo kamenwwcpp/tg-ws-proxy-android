@@ -177,7 +177,7 @@ impl WsPool {
             let mut q = state.queue.lock().await;
             while let Some(entry) = q.pop_front() {
                 let age = now - entry.created;
-                if age > WS_POOL_REUSE_MAX_AGE || entry.ws.is_closed() {
+                if age > WS_POOL_REUSE_MAX_AGE || entry.ws.peer_closed() {
                     let e = entry;
                     tokio::spawn(async move {
                         e.ws.close().await;
@@ -389,7 +389,7 @@ impl WsPool {
                 let mut ready = VecDeque::with_capacity(q.len());
                 let mut expired = Vec::new();
                 while let Some(e) = q.pop_front() {
-                    if now - e.created >= WS_POOL_REUSE_MAX_AGE || e.ws.is_closed() {
+                    if now - e.created >= WS_POOL_REUSE_MAX_AGE || e.ws.peer_closed() {
                         expired.push(e.ws);
                     } else {
                         ready.push_back(e);
@@ -551,7 +551,7 @@ impl CfWorkerPool {
             let bucket = map.entry(dc).or_insert_with(VecDeque::new);
             let mut hit = None;
             while let Some(e) = bucket.pop_front() {
-                if now - e.created > CF_WORKER_POOL_MAX_AGE || e.ws.is_closed() {
+                if now - e.created > CF_WORKER_POOL_MAX_AGE || e.ws.peer_closed() {
                     let ws = e.ws;
                     tokio::spawn(async move {
                         ws.close().await;
@@ -2172,7 +2172,7 @@ pub async fn run_proxy(
         *m = dc_opt_map.clone();
     }
 
-    start_cfproxy_refresh();
+    start_cfproxy_refresh(cancel_root.clone());
 
     {
         let p = pools.clone();

@@ -1,4 +1,4 @@
-import java.util.Properties
+﻿import java.util.Properties
 
 plugins {
     id("com.android.application")
@@ -12,8 +12,8 @@ android {
     defaultConfig {
         applicationId = "com.amurcanov.tgwsproxy"
         targetSdk = 35
-        versionCode = 130
-        versionName = "1.3.0"
+        versionCode = 131
+        versionName = "1.3.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -59,9 +59,9 @@ android {
         create("release") {
             val keyFile = localProperties.getProperty("KEYSTORE_FILE")
             if (keyFile != null) {
-                // Резолвим путь: если начинается с "..", берём от корня проекта
+                // Р РµР·РѕР»РІРёРј РїСѓС‚СЊ: РµСЃР»Рё РЅР°С‡РёРЅР°РµС‚СЃСЏ СЃ "..", Р±РµСЂС‘Рј РѕС‚ РєРѕСЂРЅСЏ РїСЂРѕРµРєС‚Р°
                 val resolvedFile = if (keyFile.startsWith("..")) {
-                    // ../release.keystore -> корень проекта / release.keystore
+                    // ../release.keystore -> РєРѕСЂРµРЅСЊ РїСЂРѕРµРєС‚Р° / release.keystore
                     file(rootDir.resolve(keyFile.substring(3)))
                 } else {
                     file(keyFile)
@@ -98,9 +98,9 @@ android {
             
             if (resolvedFile != null && resolvedFile.exists()) {
                 signingConfig = signingConfigs.getByName("release")
-                println("✅ Signing config applied: ${resolvedFile.absolutePath}")
+                println("вњ… Signing config applied: ${resolvedFile.absolutePath}")
             } else {
-                println("⚠️ WARNING: Keystore not found, using debug signing")
+                println("вљ пёЏ WARNING: Keystore not found, using debug signing")
                 println("   Looked for: ${resolvedFile?.absolutePath ?: keyFile}")
             }
         }
@@ -113,7 +113,7 @@ android {
         compose = true
         buildConfig = true
     }
-    // composeOptions removed — AGP 9.x handles Compose compiler internally
+    // composeOptions removed вЂ” AGP 9.x handles Compose compiler internally
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"

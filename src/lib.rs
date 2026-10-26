@@ -182,6 +182,27 @@ pub extern "C" fn StopProxy() -> c_int {
     0
 }
 
+/// Смена активной сети (Wi-Fi <-> LTE, новый Wi-Fi). Сокеты пула от старой сети
+/// молча мертвы, а cooldown/blacklist/backoff посчитаны для другого маршрута —
+/// сбрасываем всё, пул доберётся заново по требованию.
+#[unsafe(no_mangle)]
+pub extern "C" fn NetworkChanged() -> c_int {
+    let pools = match state_cell().lock().as_ref() {
+        Some(s) => s.pools.clone(),
+        None => return -1,
+    };
+    linfo!("Network changed: resetting pools and failure state");
+    WS_BLACKLIST.write().clear();
+    DC_FAIL_UNTIL.write().clear();
+    IP_FAIL_UNTIL.write().clear();
+    proxy::reset_tcp_backoff();
+    cfproxy::clear_cfproxy_429_cooldowns();
+    runtime().spawn(async move {
+        pools.reset().await;
+    });
+    0
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn SetPoolSize(size: c_int) {
     // Оригинал: pool_size = max(0, N); 0 отключает преконнект пула.
