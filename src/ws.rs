@@ -9,7 +9,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -193,9 +193,43 @@ pub struct RawWebSocket {
     frag: tokio::sync::Mutex<Vec<u8>>,
     pub closed: AtomicBool,
     pub secure: bool,
+    // Живость апстрима: время (CLOCK_BOOTTIME, мс) и счётчик любых входящих
+    // фреймов, включая pong.
+    last_rx_ms: AtomicU64,
+    rx_seq: AtomicU64,
+}
+
+fn boot_ms() -> u64 {
+    (now_monotonic() * 1000.0) as u64
 }
 
 impl RawWebSocket {
+    fn new(reader: WsReader, writer: WsWriter, secure: bool) -> RawWebSocket {
+        RawWebSocket {
+            reader: tokio::sync::Mutex::new(reader),
+            writer: tokio::sync::Mutex::new(writer),
+            frag: tokio::sync::Mutex::new(Vec::new()),
+            closed: AtomicBool::new(false),
+            secure,
+            last_rx_ms: AtomicU64::new(boot_ms()),
+            rx_seq: AtomicU64::new(0),
+        }
+    }
+
+    fn mark_rx(&self) {
+        self.last_rx_ms.store(boot_ms(), Ordering::Relaxed);
+        self.rx_seq.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Сколько апстрим молчит (с учётом сна телефона).
+    pub fn rx_idle(&self) -> Duration {
+        Duration::from_millis(boot_ms().saturating_sub(self.last_rx_ms.load(Ordering::Relaxed)))
+    }
+
+    pub fn rx_seq(&self) -> u64 {
+        self.rx_seq.load(Ordering::Relaxed)
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
     }
@@ -382,7 +416,10 @@ impl RawWebSocket {
             let frame = {
                 let mut reader = self.reader.lock().await;
                 match tokio::time::timeout(dur, read_frame_match(&mut reader)).await {
-                    Ok(Ok(v)) => v,
+                    Ok(Ok(v)) => {
+                        self.mark_rx();
+                        v
+                    }
                     Ok(Err(e)) => {
                         self.closed.store(true, Ordering::Relaxed);
                         return Err(e);
@@ -434,7 +471,11 @@ impl RawWebSocket {
 
     async fn read_frame(&self) -> Result<(u8, Vec<u8>, bool), WsError> {
         let mut reader = self.reader.lock().await;
-        read_frame_match(&mut reader).await
+        let res = read_frame_match(&mut reader).await;
+        if res.is_ok() {
+            self.mark_rx();
+        }
+        res
     }
 }
 
@@ -656,13 +697,11 @@ async fn handshake_tls(
     let (status_code, first_line, headers) =
         read_http_response(&mut bufreader, timeout).await?;
     if status_code == 101 {
-        return Ok(RawWebSocket {
-            reader: tokio::sync::Mutex::new(WsReader::Tls(bufreader)),
-            writer: tokio::sync::Mutex::new(WsWriter::Tls(write_half)),
-            frag: tokio::sync::Mutex::new(Vec::new()),
-            closed: AtomicBool::new(false),
-            secure: true,
-        });
+        return Ok(RawWebSocket::new(
+            WsReader::Tls(bufreader),
+            WsWriter::Tls(write_half),
+            true,
+        ));
     }
     let location = headers.get("location").cloned().unwrap_or_default();
     Err(WsError::Handshake(WsHandshakeError {
@@ -696,13 +735,11 @@ async fn handshake_plain(
     let (status_code, first_line, headers) =
         read_http_response(&mut bufreader, timeout).await?;
     if status_code == 101 {
-        return Ok(RawWebSocket {
-            reader: tokio::sync::Mutex::new(WsReader::Plain(bufreader)),
-            writer: tokio::sync::Mutex::new(WsWriter::Plain(write_half)),
-            frag: tokio::sync::Mutex::new(Vec::new()),
-            closed: AtomicBool::new(false),
-            secure: false,
-        });
+        return Ok(RawWebSocket::new(
+            WsReader::Plain(bufreader),
+            WsWriter::Plain(write_half),
+            false,
+        ));
     }
     let location = headers.get("location").cloned().unwrap_or_default();
     Err(WsError::Handshake(WsHandshakeError {

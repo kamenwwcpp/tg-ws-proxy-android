@@ -15,9 +15,17 @@ pub const DEFAULT_SEND_BUF: usize = 256 * 1024;
 pub const DEFAULT_POOL_SZ: i32 = 4;
 
 // proxy/tg_ws_proxy.py: IP_FAIL_COOLDOWN / DC_FAIL_COOLDOWN / WS_FAIL_TIMEOUT
-pub const IP_FAIL_COOLDOWN: f64 = 300.0;
+// На LTE одиночный таймаут — обычное дело (радио просыпается, хендовер), а
+// cooldown уводит весь DC в fallback (TCP режется, CF рвётся ТСПУ). Поэтому
+// cooldown только после IP_FAIL_STRIKES таймаутов подряд и короче апстрима.
+pub const IP_FAIL_COOLDOWN: f64 = 120.0;
+pub const IP_FAIL_STRIKES: u32 = 2;
+// Окно, в котором таймауты считаются «подряд».
+pub const IP_FAIL_STRIKE_WINDOW: f64 = 120.0;
 pub const DC_FAIL_COOLDOWN: f64 = 60.0;
-pub const WS_FAIL_TIMEOUT: f64 = 2.0;
+// Апстрим 2s: TCP+TLS+HTTP upgrade на мобильном RTT 300-700ms не влезает,
+// и один сбой цепочкой порождал следующие.
+pub const WS_FAIL_TIMEOUT: f64 = 4.0;
 // Прямой WS-коннект при отсутствии cooldown — 5.0 как в оригинале.
 pub const WS_DIRECT_TIMEOUT: f64 = 5.0;
 pub const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
@@ -55,6 +63,23 @@ pub const BRIDGE_READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 // Пинг только если WS молчит дольше этого. Каждый пинг будит LTE/5G радио
 // (~10s tail), 30s было слишком часто; NAT у операторов держит дольше 2 минут.
 pub const BRIDGE_PING_INTERVAL: Duration = Duration::from_secs(120);
+// Проверка живости WS: если апстрим молчал дольше BRIDGE_PROBE_IDLE, а клиент
+// снова что-то шлёт (TG вышел из фона) — пингуем и ждём любой фрейм.
+// После сна телефона NAT оператора уже забыл сокет: без ответа за
+// BRIDGE_PONG_TIMEOUT закрываем сессию, и TG сразу переподключается,
+// а не висит на мёртвом соединении до перезапуска.
+pub const BRIDGE_PROBE_IDLE: Duration = Duration::from_secs(25);
+pub const BRIDGE_PONG_TIMEOUT: Duration = Duration::from_secs(10);
+// TG свёрнут, а экран включён (другое приложение): TG молчит, и NAT/ТСПУ
+// оператора тихо забывают простаивающий сокет за пару минут. Радио при
+// включённом экране и так активно, поэтому keepalive чаще почти бесплатен.
+pub const BRIDGE_PING_INTERVAL_SCREEN_ON: Duration = Duration::from_secs(45);
+pub const BRIDGE_WATCHDOG_TICK: Duration = Duration::from_secs(20);
+pub static SCREEN_ON: AtomicBool = AtomicBool::new(true);
+// Если прямой WS не ответил за это время — параллельно стартуем fronting.
+pub const FRONTING_HEDGE_DELAY: Duration = Duration::from_millis(2500);
+// Потолок на перебор CF-доменов для одного соединения.
+pub const CFPROXY_ACQUIRE_DEADLINE: Duration = Duration::from_secs(20);
 pub const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const WS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
 pub const WS_BRIDGE_CHUNK_SIZE: usize = 64 * 1024;
@@ -64,7 +89,9 @@ pub const POOLED_FRAME_CAP: usize = WS_BRIDGE_CHUNK_SIZE + 32;
 pub const WS_POOL_REUSE_MAX_AGE: f64 = 120.0;
 pub const WS_POOL_CHECK_INTERVAL: f64 = 5.0;
 pub const WS_POOL_REFILL_BACKOFF_INITIAL: f64 = 1.0;
-pub const WS_POOL_REFILL_BACKOFF_MAX: f64 = 3600.0;
+// Апстрим 3600s: если сеть пропадала, пул отключался на час. Refill идёт
+// только по запросу, так что короткий потолок батарею не тратит.
+pub const WS_POOL_REFILL_BACKOFF_MAX: f64 = 120.0;
 pub const WS_POOL_CONNECT_TIMEOUT: f64 = 8.0;
 pub const WS_POOL_FRONTING_TIMEOUT: f64 = 7.0;
 pub const FRONTING_SNI: &str = "sprinthost.ru";
@@ -237,6 +264,17 @@ pub static DC_FAIL_UNTIL: Lazy<RwLock<HashMap<DcKey, f64>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 pub static IP_FAIL_UNTIL: Lazy<RwLock<HashMap<String, f64>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+// ip -> (таймаутов подряд, время последнего)
+pub static IP_TIMEOUT_STRIKES: Lazy<RwLock<HashMap<String, (u32, f64)>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Сброс всех cooldown'ов/чёрных списков (смена сети, стоп).
+pub fn clear_failure_state() {
+    WS_BLACKLIST.write().clear();
+    DC_FAIL_UNTIL.write().clear();
+    IP_FAIL_UNTIL.write().clear();
+    IP_TIMEOUT_STRIKES.write().clear();
+}
 
 pub static ZERO64: [u8; 64] = [0u8; 64];
 
@@ -602,7 +640,18 @@ pub fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Секунды по CLOCK_BOOTTIME: в отличие от Instant (CLOCK_MONOTONIC) идут и во
+/// время сна телефона. Иначе после часа в Doze пул считал сокеты «свежими»
+/// (возраст без учёта сна), хотя NAT оператора их давно забыл, а cooldown'ы
+/// до сна продолжали действовать после пробуждения.
 pub fn now_monotonic() -> f64 {
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } == 0 {
+            return ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9;
+        }
+    }
     use std::time::Instant;
     static START: Lazy<Instant> = Lazy::new(Instant::now);
     START.elapsed().as_secs_f64()

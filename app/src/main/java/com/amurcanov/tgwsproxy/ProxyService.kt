@@ -15,6 +15,7 @@ import android.net.Network
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
@@ -50,6 +51,7 @@ class ProxyService : Service() {
     private var lastNotificationContent: String = ""
     private var lastNotificationAtMs: Long = 0L
     private var notificationStartedAtMs: Long = 0L
+    private var screenOffAtMs: Long = 0L
 
     // Всё состояние ниже трогается только с main-потока.
     private var startInProgress = false
@@ -80,6 +82,9 @@ class ProxyService : Service() {
         private const val STATS_UPDATE_MS = 5_000L
         private const val NOTIFICATION_MIN_UPDATE_MS = 5_000L
         private const val NATIVE_STOP_WAIT_MS = 3_000L
+        // Проверять сессии при включении экрана, только если он был выключен
+        // хотя бы столько (быстрый взгляд на часы радио не будит).
+        private const val WAKE_PROBE_MIN_OFF_MS = 60_000L
 
         // Нативное состояние процессное и не потокобезопасно между Start/Stop:
         // параллельные вызовы давали -1 на втором StartProxy (и авто-стоп рабочего
@@ -203,7 +208,9 @@ class ProxyService : Service() {
         // Постоянный PARTIAL_WAKE_LOCK не давал процессору засыпать вообще.
         registerScreenReceiver()
         registerNetworkCallback()
-        if ((getSystemService(POWER_SERVICE) as PowerManager).isInteractive) {
+        val interactive = (getSystemService(POWER_SERVICE) as PowerManager).isInteractive
+        pushScreenState(interactive)
+        if (interactive) {
             startStatsUpdates()
         }
 
@@ -289,8 +296,29 @@ class ProxyService : Service() {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 when (intent.action) {
-                    Intent.ACTION_SCREEN_ON -> if (!stopInProgress && (_isRunning.value || startInProgress)) startStatsUpdates()
-                    Intent.ACTION_SCREEN_OFF -> stopStatsUpdates()
+                    Intent.ACTION_SCREEN_ON -> {
+                        pushScreenState(true)
+                        if (!stopInProgress && (_isRunning.value || startInProgress)) startStatsUpdates()
+                        val offFor = SystemClock.elapsedRealtime() - screenOffAtMs
+                        if (screenOffAtMs != 0L && offFor >= WAKE_PROBE_MIN_OFF_MS && _isRunning.value && !stopInProgress) {
+                            // Пока пользователь разблокирует и открывает TG, ядро
+                            // успевает найти и закрыть умершие во сне сессии —
+                            // TG сразу переподключается, а не висит.
+                            nativeScope.launch {
+                                try {
+                                    NativeProxy.probeConnections()
+                                } catch (e: Throwable) {
+                                    Log.w(TAG, "ProbeConnections failed", e)
+                                }
+                            }
+                        }
+                        screenOffAtMs = 0L
+                    }
+                    Intent.ACTION_SCREEN_OFF -> {
+                        pushScreenState(false)
+                        stopStatsUpdates()
+                        screenOffAtMs = SystemClock.elapsedRealtime()
+                    }
                 }
             }
         }
@@ -300,6 +328,16 @@ class ProxyService : Service() {
         }
         ContextCompat.registerReceiver(this, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
         screenReceiver = receiver
+    }
+
+    private fun pushScreenState(on: Boolean) {
+        nativeScope.launch {
+            try {
+                NativeProxy.setScreenOn(on)
+            } catch (e: Throwable) {
+                Log.w(TAG, "SetScreenOn failed", e)
+            }
+        }
     }
 
     private fun unregisterScreenReceiver() {
@@ -320,12 +358,23 @@ class ProxyService : Service() {
         val callback = object : ConnectivityManager.NetworkCallback() {
             @Volatile
             private var current: Network? = null
+            @Volatile
+            private var seenFirst = false
+
+            override fun onLost(network: Network) {
+                // Сеть пропала (нет сигнала, туннель). Если вернётся та же самая,
+                // onAvailable всё равно должен сбросить состояние: сокеты и NAT
+                // за время пропадания почти наверняка умерли.
+                if (network == current) current = null
+            }
 
             override fun onAvailable(network: Network) {
                 val prev = current
                 current = network
                 // Первый onAvailable прилетает сразу при регистрации — это не смена.
-                if (prev != null && prev != network) {
+                val first = !seenFirst
+                seenFirst = true
+                if (!first && prev != network) {
                     nativeScope.launch {
                         try {
                             NativeProxy.networkChanged()

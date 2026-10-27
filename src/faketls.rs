@@ -2,11 +2,11 @@ use crate::config::{log_debug, log_warn, STATS};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
-use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
+use std::task::{ready, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
 pub const TLS_RECORD_HANDSHAKE: u8 = 0x16;
@@ -155,10 +155,14 @@ fn wrap_tls_record(data: &[u8]) -> Vec<u8> {
     out
 }
 
+// Читатель TLS-записей как явная машина состояний. Раньше на каждый poll
+// создавался новый future c read_exact и выбрасывался на Pending: частично
+// прочитанный 5-байтный заголовок терялся, и поток рассинхронизировался.
 struct TlsRecordReader {
     inner: ReadHalf<TcpStream>,
-    buf: Vec<u8>,
-    pos: usize,
+    hdr: [u8; 5],
+    hdr_len: usize,
+    skip_left: usize,
     read_left: usize,
 }
 
@@ -166,158 +170,157 @@ impl TlsRecordReader {
     fn new(inner: ReadHalf<TcpStream>) -> Self {
         TlsRecordReader {
             inner,
-            buf: Vec::new(),
-            pos: 0,
+            hdr: [0u8; 5],
+            hdr_len: 0,
+            skip_left: 0,
             read_left: 0,
         }
     }
+}
 
-    fn compact(&mut self) {
-        if self.pos > 0 {
-            self.buf.drain(..self.pos);
-            self.pos = 0;
-        }
-    }
-
-    fn next_payload(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + Send + '_>> {
-        Box::pin(async move {
-            loop {
-                if self.read_left > 0 {
-                    let want = std::cmp::min(self.read_left, 16384);
-                    let mut chunk = vec![0u8; want];
-                    let n = self.inner.read(&mut chunk).await?;
-                    if n == 0 {
-                        return Ok(Vec::new());
-                    }
-                    chunk.truncate(n);
-                    self.read_left -= n;
-                    return Ok(chunk);
-                }
-
-                let mut hdr = [0u8; 5];
-                self.inner.read_exact(&mut hdr).await?;
-                let rtype = hdr[0];
-                let rec_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
-
-                if rtype == TLS_RECORD_CCS {
-                    if rec_len > 0 {
-                        let mut junk = vec![0u8; rec_len];
-                        self.inner.read_exact(&mut junk).await?;
-                    }
-                    continue;
-                }
-
-                if rtype != TLS_RECORD_APPDATA {
-                    return Ok(Vec::new());
-                }
-
-                let want = std::cmp::min(rec_len, 65536);
-                let mut chunk = vec![0u8; want];
-                let n = self.inner.read(&mut chunk).await?;
-                if n == 0 {
-                    return Ok(Vec::new());
-                }
-                chunk.truncate(n);
-                if rec_len > n {
-                    self.read_left = rec_len - n;
-                }
-                return Ok(chunk);
-            }
-        })
-    }
+fn faketls_eof() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "faketls eof")
 }
 
 impl AsyncRead for TlsRecordReader {
     fn poll_read(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-
         loop {
-            let avail = this.buf.len() - this.pos;
-            if avail > 0 {
-                let n = std::cmp::min(avail, buf.remaining());
-                let src = &this.buf[this.pos..this.pos + n];
-                buf.put_slice(src);
-                this.pos += n;
-                if this.pos == this.buf.len() {
-                    this.buf.clear();
-                    this.pos = 0;
+            if this.read_left > 0 {
+                if buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
                 }
-                return std::task::Poll::Ready(Ok(()));
+                let max = this.read_left.min(buf.remaining());
+                let n = {
+                    let mut sub = buf.take(max);
+                    ready!(Pin::new(&mut this.inner).poll_read(cx, &mut sub))?;
+                    sub.filled().len()
+                };
+                if n == 0 {
+                    return Poll::Ready(Err(faketls_eof()));
+                }
+                // SAFETY: inner заполнил n байт в незаполненной части buf.
+                unsafe { buf.assume_init(n) };
+                buf.advance(n);
+                this.read_left -= n;
+                return Poll::Ready(Ok(()));
             }
 
-            this.compact();
-            let polled = {
-                let mut fut = this.next_payload();
-                Pin::new(&mut fut).poll(cx)
-            };
-            match polled {
-                std::task::Poll::Pending => return std::task::Poll::Pending,
-                std::task::Poll::Ready(Err(e)) => {
-                    return std::task::Poll::Ready(Err(
-                        if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "faketls eof")
-                        } else {
-                            e
-                        },
-                    ))
+            if this.skip_left > 0 {
+                let mut scratch = [0u8; 512];
+                let max = this.skip_left.min(scratch.len());
+                let mut rb = ReadBuf::new(&mut scratch[..max]);
+                ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+                let n = rb.filled().len();
+                if n == 0 {
+                    return Poll::Ready(Err(faketls_eof()));
                 }
-                std::task::Poll::Ready(Ok(payload)) => {
-                    if payload.is_empty() {
-                        return std::task::Poll::Ready(Ok(()));
+                this.skip_left -= n;
+                continue;
+            }
+
+            while this.hdr_len < 5 {
+                let mut rb = ReadBuf::new(&mut this.hdr[this.hdr_len..]);
+                ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+                let n = rb.filled().len();
+                if n == 0 {
+                    if this.hdr_len == 0 {
+                        return Poll::Ready(Ok(())); // чистый EOF между записями
                     }
-                    this.buf = payload;
-                    this.pos = 0;
+                    return Poll::Ready(Err(faketls_eof()));
                 }
+                this.hdr_len += n;
+            }
+            this.hdr_len = 0;
+            let rec_len = u16::from_be_bytes([this.hdr[3], this.hdr[4]]) as usize;
+            match this.hdr[0] {
+                TLS_RECORD_CCS => this.skip_left = rec_len,
+                TLS_RECORD_APPDATA => this.read_left = rec_len,
+                // Как раньше: чужой тип записи = конец потока.
+                _ => return Poll::Ready(Ok(())),
             }
         }
     }
 }
 
+// Писатель TLS-записей. Раньше при частичной записи в сокет (TG в фоне не
+// читает, буфер полон) на провод уходил обрывок записи, а вызывающему
+// возвращалось «записано n байт» — следующий вызов оборачивал хвост в новую
+// запись, и поток ломался. Теперь запись досылается целиком, прежде чем
+// её байты считаются принятыми.
 struct TlsRecordWriter {
     inner: WriteHalf<TcpStream>,
+    pending: Vec<u8>,
+    pos: usize,
+    pending_src: usize,
 }
 
 impl TlsRecordWriter {
     fn new(inner: WriteHalf<TcpStream>) -> Self {
-        TlsRecordWriter { inner }
+        TlsRecordWriter {
+            inner,
+            pending: Vec::new(),
+            pos: 0,
+            pending_src: 0,
+        }
+    }
+
+    fn poll_drain(&mut self, cx: &mut std::task::Context<'_>) -> Poll<std::io::Result<()>> {
+        while self.pos < self.pending.len() {
+            let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &self.pending[self.pos..]))?;
+            if n == 0 {
+                return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+            }
+            self.pos += n;
+        }
+        self.pending.clear();
+        self.pos = 0;
+        Poll::Ready(Ok(()))
     }
 }
 
 impl AsyncWrite for TlsRecordWriter {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
+    ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        let wrapped = wrap_tls_record(buf);
-        match Pin::new(&mut this.inner).poll_write(cx, &wrapped) {
-            std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(Ok(n)) => {
-                std::task::Poll::Ready(Ok(if n >= buf.len() { buf.len() } else { n }))
+        if this.pending.is_empty() {
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
             }
-            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
+            let n = buf.len().min(TLS_APPDATA_MAX);
+            this.pending = wrap_tls_record(&buf[..n]);
+            this.pos = 0;
+            this.pending_src = n;
         }
+        // При Pending вызывающий (write_all) повторит с тем же buf, и мы
+        // просто дошлём начатую запись.
+        ready!(this.poll_drain(cx))?;
+        Poll::Ready(Ok(this.pending_src))
     }
 
     fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_drain(cx))?;
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_drain(cx))?;
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 

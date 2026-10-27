@@ -8,7 +8,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,6 +29,54 @@ pub fn ws_pool_fronting_first() -> bool {
 
 pub fn set_ws_pool_fronting_first(v: bool) {
     TRY_FRONTING_FIRST.store(v, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Живость сессий. Мост, у которого апстрим молча умер (сон телефона, NAT
+// оператора, смена сети), иначе жил до BRIDGE_READ_TIMEOUT, а TG всё это
+// время ждал ответа — отсюда «помогает только перезапуск TG».
+// ---------------------------------------------------------------------------
+
+static BRIDGE_SEQ: AtomicU64 = AtomicU64::new(1);
+static BRIDGES: once_cell::sync::Lazy<parking_lot::Mutex<HashMap<u64, Arc<tokio::sync::Notify>>>> =
+    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+struct BridgeRegistration(u64);
+
+impl BridgeRegistration {
+    fn new(probe: Arc<tokio::sync::Notify>) -> Self {
+        let id = BRIDGE_SEQ.fetch_add(1, Ordering::Relaxed);
+        BRIDGES.lock().insert(id, probe);
+        BridgeRegistration(id)
+    }
+}
+
+impl Drop for BridgeRegistration {
+    fn drop(&mut self) {
+        BRIDGES.lock().remove(&self.0);
+    }
+}
+
+/// Попросить все активные мосты проверить апстрим (пробуждение, смена сети).
+/// Мост пингует только если апстрим молчал дольше BRIDGE_PROBE_IDLE.
+pub fn probe_all_bridges() -> usize {
+    let map = BRIDGES.lock();
+    for n in map.values() {
+        n.notify_one();
+    }
+    map.len()
+}
+
+// Пуловые WS, созданные раньше этой отметки, считаются мёртвыми: если один
+// простаивавший сокет умер молча, его соседи по той же сети почти наверняка тоже.
+static POOL_STALE_BEFORE: AtomicU64 = AtomicU64::new(0);
+
+pub fn mark_pool_stale() {
+    POOL_STALE_BEFORE.store(now_monotonic().to_bits(), Ordering::Relaxed);
+}
+
+fn pool_entry_stale(created: f64) -> bool {
+    created < f64::from_bits(POOL_STALE_BEFORE.load(Ordering::Relaxed))
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +225,10 @@ impl WsPool {
             let mut q = state.queue.lock().await;
             while let Some(entry) = q.pop_front() {
                 let age = now - entry.created;
-                if age > WS_POOL_REUSE_MAX_AGE || entry.ws.peer_closed() {
+                if age > WS_POOL_REUSE_MAX_AGE
+                    || pool_entry_stale(entry.created)
+                    || entry.ws.peer_closed()
+                {
                     let e = entry;
                     tokio::spawn(async move {
                         e.ws.close().await;
@@ -287,6 +338,12 @@ impl WsPool {
         }
 
         if connected > 0 {
+            // IP доказанно доступен: снимаем cooldown, иначе новые коннекты ещё
+            // до 2 минут уходили бы в fallback при живом прямом пути.
+            if IP_FAIL_UNTIL.write().remove(&target_ip).is_some() {
+                linfo!("WS pool reached {}: cooldown cleared", target_ip);
+            }
+            IP_TIMEOUT_STRIKES.write().remove(&target_ip);
             self.report_success(slot.dc, slot.is_media != 0).await;
             self.schedule_rotation(slot, target_ip, domains).await;
         } else {
@@ -389,7 +446,10 @@ impl WsPool {
                 let mut ready = VecDeque::with_capacity(q.len());
                 let mut expired = Vec::new();
                 while let Some(e) = q.pop_front() {
-                    if now - e.created >= WS_POOL_REUSE_MAX_AGE || e.ws.peer_closed() {
+                    if now - e.created >= WS_POOL_REUSE_MAX_AGE
+                        || pool_entry_stale(e.created)
+                        || e.ws.peer_closed()
+                    {
                         expired.push(e.ws);
                     } else {
                         ready.push_back(e);
@@ -582,16 +642,16 @@ impl CfWorkerPool {
         }
     }
 
-    async fn schedule_refill(&self, dc: i32, fallback_dst: String, worker_domains: Vec<String>) {
-        {
-            let mut r = self.refilling.lock().await;
-            if r.contains(&dc) {
-                return;
-            }
-            r.insert(dc);
-        }
-        // PER_DC_LIMIT уважаем через проверку размера в refill.
-        let _ = (fallback_dst, worker_domains);
+    async fn schedule_refill(
+        self: &Arc<Self>,
+        dc: i32,
+        fallback_dst: String,
+        worker_domains: Vec<String>,
+    ) {
+        // Раньше флаг refilling ставился, а refill не запускался и флаг никто
+        // не снимал — после первого попадания пул для DC больше не пополнялся.
+        // refill_now сам ставит/снимает флаг и уважает PER_DC_LIMIT.
+        self.refill_now(dc, fallback_dst, worker_domains).await;
     }
 
     pub async fn refill_now(
@@ -801,13 +861,13 @@ pub async fn bridge_ws<R, W>(
     mut tg_enc: TrackedStream,
     mut tg_dec: TrackedStream,
     cancel_token: CancellationToken,
+    check_liveness: bool,
 ) where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
     let dc_tag = format!("DC{}{}", dc, if is_media { "m" } else { "" });
     let ws = Arc::new(ws);
-    let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
     // Sticky: Notify::notify_waiters терял сигнал, если вторая половина
     // в этот момент висела в write/send — полумёртвый мост жил до таймаута.
     let cancel = cancel_token.child_token();
@@ -816,35 +876,75 @@ pub async fn bridge_ws<R, W>(
     let mut conn_read = conn_read;
     let mut conn_write = conn_write;
 
-    // ping keepalive (мобильное улучшение поверх оригинала).
+    // Сторож апстрима. Раньше пинг уходил «в никуда»: ответ не проверялся, и
+    // мёртвый после сна/смены сети WS держал TG до 5 минут.
+    let probe = Arc::new(tokio::sync::Notify::new());
+    let _registration = BridgeRegistration::new(probe.clone());
+    let close_reason_wd = Arc::new(Mutex::new(String::new()));
     let ws_ping = ws.clone();
-    let la_ping = last_activity.clone();
+    let probe_wd = probe.clone();
     let cancel_ping = cancel.clone();
     let cancel_token_ping = cancel_token.clone();
+    let close_reason_wd_c = close_reason_wd.clone();
     let ping_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(BRIDGE_PING_INTERVAL / 2);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval.tick().await;
         loop {
-            tokio::select! {
+            let requested = tokio::select! {
                 _ = cancel_token_ping.cancelled() => return,
                 _ = cancel_ping.cancelled() => return,
-                _ = interval.tick() => {
-                    let idle = la_ping.lock().await.elapsed();
-                    if idle > BRIDGE_PING_INTERVAL {
-                        if ws_ping.send_ping().await.is_err() {
-                            cancel_ping.cancel();
-                            return;
-                        }
-                    }
+                _ = probe_wd.notified() => true,
+                _ = tokio::time::sleep(BRIDGE_WATCHDOG_TICK) => false,
+            };
+            let idle = ws_ping.rx_idle();
+            let threshold = if requested {
+                BRIDGE_PROBE_IDLE
+            } else if SCREEN_ON.load(Ordering::Relaxed) {
+                BRIDGE_PING_INTERVAL_SCREEN_ON
+            } else {
+                BRIDGE_PING_INTERVAL
+            };
+            if idle < threshold {
+                continue;
+            }
+            let seq_before = ws_ping.rx_seq();
+            if ws_ping.send_ping().await.is_err() {
+                *close_reason_wd_c.lock().await = "upstream: ping_failed".to_string();
+                if check_liveness {
+                    mark_pool_stale();
                 }
+                cancel_ping.cancel();
+                return;
+            }
+            if !check_liveness {
+                continue;
+            }
+            // Ждём любой входящий фрейм (pong или данные). Таймер tokio идёт
+            // только пока CPU не спит, так что сон телефона ложной смерти не даёт.
+            let alive = tokio::time::timeout(BRIDGE_PONG_TIMEOUT, async {
+                while ws_ping.rx_seq() == seq_before {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            });
+            let alive = tokio::select! {
+                _ = cancel_token_ping.cancelled() => return,
+                _ = cancel_ping.cancelled() => return,
+                r = alive => r.is_ok(),
+            };
+            if !alive {
+                *close_reason_wd_c.lock().await = format!(
+                    "upstream: no pong in {}s (idle {:.0}s)",
+                    BRIDGE_PONG_TIMEOUT.as_secs(),
+                    idle.as_secs_f64()
+                );
+                mark_pool_stale();
+                cancel_ping.cancel();
+                return;
             }
         }
     });
 
     // up: client -> ws
     let ws_up = ws.clone();
-    let la_up = last_activity.clone();
+    let probe_up = probe.clone();
     let cancel_up = cancel.clone();
     let cancel_token_up = cancel_token.clone();
     let up_bytes = Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -897,7 +997,11 @@ pub async fn bridge_ws<R, W>(
             STATS.bytes_up.fetch_add(n as i64, Ordering::Relaxed);
             up_bytes_c.fetch_add(n as i64, Ordering::Relaxed);
             up_packets_c.fetch_add(1, Ordering::Relaxed);
-            *la_up.lock().await = std::time::Instant::now();
+            // TG снова говорит после долгой тишины апстрима (вышел из фона,
+            // телефон проснулся) — пусть сторож проверит, жив ли WS.
+            if ws_up.rx_idle() >= BRIDGE_PROBE_IDLE {
+                probe_up.notify_one();
+            }
 
             clt_dec.xor(chunk);
             tg_enc.xor(chunk);
@@ -926,7 +1030,6 @@ pub async fn bridge_ws<R, W>(
 
     // down: ws -> client
     let ws_down = ws.clone();
-    let la_down = last_activity.clone();
     let cancel_down = cancel.clone();
     let cancel_token_down = cancel_token.clone();
     let down_bytes = Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -962,7 +1065,6 @@ pub async fn bridge_ws<R, W>(
             STATS.bytes_down.fetch_add(n as i64, Ordering::Relaxed);
             down_bytes_c.fetch_add(n as i64, Ordering::Relaxed);
             down_packets_c.fetch_add(1, Ordering::Relaxed);
-            *la_down.lock().await = std::time::Instant::now();
 
             tg_dec.xor(&mut data);
             clt_enc.xor(&mut data);
@@ -982,7 +1084,10 @@ pub async fn bridge_ws<R, W>(
     let close_reason = {
         let up_r = close_reason_up.lock().await.clone();
         let down_r = close_reason_down.lock().await.clone();
-        if !down_r.is_empty() {
+        let wd_r = close_reason_wd.lock().await.clone();
+        if !wd_r.is_empty() {
+            wd_r
+        } else if !down_r.is_empty() {
             down_r
         } else if !up_r.is_empty() {
             up_r
@@ -1036,6 +1141,7 @@ pub async fn bridge_ws_stream(
         tg_enc,
         tg_dec,
         cancel_token,
+        true,
     )
     .await;
 }
@@ -1303,36 +1409,44 @@ async fn cfproxy_acquire_ws(
     }
 
     if ws.is_none() && ordered.len() > 1 {
-        let remaining_domains: Vec<String> = ordered[1..].to_vec();
+        // Берём первый успешный домен. Раньше ждали завершения ВСЕХ попыток
+        // (до ~20 доменов по 2 параллельно, каждая до ~10s) — TG висел больше
+        // минуты, хотя рабочий домен нашёлся за пару секунд. Общий дедлайн не
+        // даёт попыткам от давно ушедших клиентов копиться (при белых списках)
+        // и занимать глобальный семафор CF у новых соединений.
         let sem = Arc::new(tokio::sync::Semaphore::new(CFPROXY_FALLBACK_PARALLEL));
-        let mut handles = Vec::new();
-        for bd in remaining_domains {
+        let mut set = tokio::task::JoinSet::new();
+        for bd in ordered[1..].to_vec() {
             let sem = sem.clone();
-            let cancel = cancel_token.clone();
             let ws_path = ws_path.to_string();
-            handles.push(tokio::spawn(async move {
-                tokio::select! {
-                    _ = cancel.cancelled() => None,
-                    r = async {
-                        let _p = sem.acquire().await.ok()?;
-                        let (w, d) = try_cfproxy_base_domain(dc, &bd, &ws_path).await;
-                        w.map(|ws| (ws, d))
-                    } => r,
-                }
-            }));
+            set.spawn(async move {
+                let _p = sem.acquire_owned().await.ok()?;
+                let (w, d) = try_cfproxy_base_domain(dc, &bd, &ws_path).await;
+                w.map(|ws| (ws, d))
+            });
         }
-        for h in handles {
-            if let Ok(Some((w, d))) = h.await {
-                if ws.is_none() {
-                    ws = Some(w);
-                    chosen_domain = d;
-                } else {
-                    tokio::spawn(async move {
-                        w.close().await;
-                    });
+        let deadline = tokio::time::sleep(CFPROXY_ACQUIRE_DEADLINE);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = cancel_token.cancelled() => break,
+                _ = &mut deadline => {
+                    lwarn!(" CF fallback DC{}{}: дедлайн {}s", dc, m_tag, CFPROXY_ACQUIRE_DEADLINE.as_secs());
+                    break;
                 }
+                r = set.join_next() => match r {
+                    None => break,
+                    Some(Ok(Some((w, d)))) => {
+                        ws = Some(w);
+                        chosen_domain = d;
+                        break;
+                    }
+                    Some(_) => continue,
+                },
             }
         }
+        // Остальные попытки больше не нужны.
+        set.abort_all();
     }
 
     match ws {
@@ -1474,7 +1588,9 @@ where
                     clt_enc.clone_state(),
                     tg_enc.clone_state(),
                     tg_dec.clone_state(),
-                cancel_token,
+                    cancel_token,
+                    // Чужой worker может не отвечать на ping — не рвём по pong.
+                    false,
                 )
                 .await;
                 return true;
@@ -1506,6 +1622,7 @@ where
                     tg_enc.clone_state(),
                     tg_dec.clone_state(),
                     cancel_token,
+                    true,
                 )
                 .await;
                 return true;
@@ -1898,15 +2015,25 @@ async fn serve_core<R, W>(
         for domain in &domains {
             let url = format!("wss://{}{} via {}", domain, ws_path, target);
             linfo!("[{}] DC{}{} -> {}", label, dc, m_tag, url);
-            // Some(true): DISABLE_SECURE (порт 80) относится только к CF. Без этого
-            // прямой WS к Telegram шёл plain HTTP с Host: kwsN.web.telegram.org.
-            match ws_connect_full_opts(&target, domain, ws_path, ws_timeout, None, Some(true)).await {
-                Ok(ws) => {
+            let allow_fronting = !is_test_dc && !ws_pool_fronting_first();
+            match connect_direct_hedged(&target, domain, ws_path, ws_timeout, allow_fronting).await {
+                DirectOutcome::Direct(ws) => {
                     all_redirects = false;
+                    // Fronting-first мог остаться от прошлой сети/сбоя: прямой путь
+                    // работает — не тратим fronting-таймаут на каждом коннекте.
+                    if ws_pool_fronting_first() {
+                        set_ws_pool_fronting_first(false);
+                    }
                     ws_opt = Some(ws);
                     break;
                 }
-                Err(WsError::Handshake(h)) if h.is_redirect() => {
+                DirectOutcome::Fronted(ws) => {
+                    all_redirects = false;
+                    linfo!("[{}] DC{}{} -> fronted wss://{} via {}", label, dc, m_tag, domain, target);
+                    ws_opt = Some(ws);
+                    break;
+                }
+                DirectOutcome::Failed(WsError::Handshake(h)) if h.is_redirect() => {
                     STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
                     ws_failed_redirect = true;
                     lwarn!(
@@ -1920,7 +2047,7 @@ async fn serve_core<R, W>(
                     );
                     continue;
                 }
-                Err(WsError::Handshake(h)) => {
+                DirectOutcome::Failed(WsError::Handshake(h)) => {
                     STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
                     all_redirects = false;
                     lwarn!(
@@ -1929,26 +2056,17 @@ async fn serve_core<R, W>(
                     );
                     continue;
                 }
-                Err(WsError::Timeout) => {
+                DirectOutcome::Failed(WsError::Timeout) => {
+                    // Fronting уже пробовался внутри connect_direct_hedged.
                     STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
                     lwarn!(
                         "[{}] DC{}{} WS connect timed out via {}",
                         label, dc, m_tag, domain
                     );
-                    // Таймаут на прямом SNI в РФ обычно = DPI; пробуем fronting
-                    // так же, как pool::_connect_one.
-                    if !is_test_dc && !ws_pool_fronting_first() {
-                        if let Some(ws) = connect_fronted(&target, domain, ws_path).await {
-                            all_redirects = false;
-                            linfo!("[{}] DC{}{} -> fronted wss://{} via {}", label, dc, m_tag, domain, target);
-                            ws_opt = Some(ws);
-                            break;
-                        }
-                    }
                     ws_timed_out = true;
                     break;
                 }
-                Err(exc) => {
+                DirectOutcome::Failed(exc) => {
                     STATS.ws_errors.fetch_add(1, Ordering::Relaxed);
                     all_redirects = false;
                     lwarn!(
@@ -1966,13 +2084,30 @@ async fn serve_core<R, W>(
     // WS failed -> fallback (порт оригинала 1-в-1).
     if ws_opt.is_none() {
         if ws_timed_out && !target.is_empty() {
-            IP_FAIL_UNTIL
-                .write()
-                .insert(target.clone(), now + IP_FAIL_COOLDOWN);
-            linfo!(
-                "[{}] DC{}{} WS connect to {} timed out, cooldown for {}s",
-                label, dc, m_tag, target, IP_FAIL_COOLDOWN as i64
-            );
+            let strikes = {
+                let mut m = IP_TIMEOUT_STRIKES.write();
+                let e = m.entry(target.clone()).or_insert((0, 0.0));
+                if now - e.1 > IP_FAIL_STRIKE_WINDOW {
+                    e.0 = 0;
+                }
+                e.0 += 1;
+                e.1 = now;
+                e.0
+            };
+            if strikes >= IP_FAIL_STRIKES {
+                IP_FAIL_UNTIL
+                    .write()
+                    .insert(target.clone(), now + IP_FAIL_COOLDOWN);
+                linfo!(
+                    "[{}] DC{}{} WS connect to {} timed out ({}x), cooldown for {}s",
+                    label, dc, m_tag, target, strikes, IP_FAIL_COOLDOWN as i64
+                );
+            } else {
+                linfo!(
+                    "[{}] DC{}{} WS connect to {} timed out ({}/{}), no cooldown yet",
+                    label, dc, m_tag, target, strikes, IP_FAIL_STRIKES
+                );
+            }
         }
 
         if ws_failed_redirect && all_redirects {
@@ -2014,6 +2149,7 @@ async fn serve_core<R, W>(
 
     if !target.is_empty() {
         IP_FAIL_UNTIL.write().remove(&target);
+        IP_TIMEOUT_STRIKES.write().remove(&target);
     }
     pools.ws.report_success(dc, is_media).await;
     STATS.connections_ws.fetch_add(1, Ordering::Relaxed);
@@ -2113,8 +2249,75 @@ async fn serve_core<R, W>(
         tg_encryptor,
         tg_decryptor,
         cancel_token,
+        true,
     )
     .await;
+}
+
+pub enum DirectOutcome {
+    Direct(RawWebSocket),
+    Fronted(RawWebSocket),
+    Failed(WsError),
+}
+
+/// Прямой WS с «хеджированием» fronting'ом. Раньше: прямой до таймаута (5s),
+/// и только потом fronting (до 7s) — 12s на коннект, TG успевал сдаться.
+/// Теперь, если прямой не ответил за FRONTING_HEDGE_DELAY, fronting стартует
+/// параллельно, побеждает первый. На Wi-Fi прямой отвечает раньше задержки,
+/// второго соединения не возникает. Таймаут/ошибки прямого — как раньше:
+/// fronting пробуется только при таймауте, редиректы/ошибки уходят наверх.
+async fn connect_direct_hedged(
+    target: &str,
+    domain: &str,
+    ws_path: &str,
+    timeout: f64,
+    allow_fronting: bool,
+) -> DirectOutcome {
+    // Some(true): DISABLE_SECURE (порт 80) относится только к CF. Без этого
+    // прямой WS к Telegram шёл plain HTTP с Host: kwsN.web.telegram.org.
+    let direct = ws_connect_full_opts(target, domain, ws_path, timeout, None, Some(true));
+    tokio::pin!(direct);
+    if !allow_fronting {
+        return match direct.await {
+            Ok(ws) => DirectOutcome::Direct(ws),
+            Err(e) => DirectOutcome::Failed(e),
+        };
+    }
+    tokio::select! {
+        r = &mut direct => {
+            return match r {
+                Ok(ws) => DirectOutcome::Direct(ws),
+                Err(WsError::Timeout) => match connect_fronted(target, domain, ws_path).await {
+                    Some(ws) => DirectOutcome::Fronted(ws),
+                    None => DirectOutcome::Failed(WsError::Timeout),
+                },
+                Err(e) => DirectOutcome::Failed(e),
+            };
+        }
+        _ = tokio::time::sleep(FRONTING_HEDGE_DELAY) => {}
+    }
+    let fronted = connect_fronted(target, domain, ws_path);
+    tokio::pin!(fronted);
+    tokio::select! {
+        r = &mut direct => match r {
+            Ok(ws) => DirectOutcome::Direct(ws),
+            Err(WsError::Timeout) => match fronted.await {
+                Some(ws) => DirectOutcome::Fronted(ws),
+                None => DirectOutcome::Failed(WsError::Timeout),
+            },
+            Err(e) => match fronted.await {
+                Some(ws) => DirectOutcome::Fronted(ws),
+                None => DirectOutcome::Failed(e),
+            },
+        },
+        f = &mut fronted => match f {
+            Some(ws) => DirectOutcome::Fronted(ws),
+            None => match direct.await {
+                Ok(ws) => DirectOutcome::Direct(ws),
+                Err(e) => DirectOutcome::Failed(e),
+            },
+        },
+    }
 }
 
 // connectDirectWS — прямой перебор доменов (тихий, для retry-пути).

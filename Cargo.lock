@@ -1082,6 +1082,7 @@ dependencies = [
  "ctr",
  "hex",
  "hmac",
+ "libc",
  "log",
  "once_cell",
  "parking_lot",
