@@ -60,24 +60,9 @@ pub const BRIDGE_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 // Апстрим: pong сбрасывает таймер чтения (таймаут на один фрейм), так что
 // живой WS по нему не умирает; срабатывает только на реально мёртвом линке.
 pub const BRIDGE_READ_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-// Пинг только если WS молчит дольше этого. Каждый пинг будит LTE/5G радио
-// (~10s tail), 30s было слишком часто; NAT у операторов держит дольше 2 минут.
+// Пинг только если WS молчит дольше этого (как в 1.3.1). Каждый пинг будит
+// LTE/5G радио, а частые пинги рвали сессии (см. Flowseal #925 -> #1036).
 pub const BRIDGE_PING_INTERVAL: Duration = Duration::from_secs(120);
-// Проверка живости WS: если апстрим молчал дольше BRIDGE_PROBE_IDLE, а клиент
-// снова что-то шлёт (TG вышел из фона) — пингуем и ждём любой фрейм.
-// После сна телефона NAT оператора уже забыл сокет: без ответа за
-// BRIDGE_PONG_TIMEOUT закрываем сессию, и TG сразу переподключается,
-// а не висит на мёртвом соединении до перезапуска.
-pub const BRIDGE_PROBE_IDLE: Duration = Duration::from_secs(25);
-pub const BRIDGE_PONG_TIMEOUT: Duration = Duration::from_secs(10);
-// TG свёрнут, а экран включён (другое приложение): TG молчит, и NAT/ТСПУ
-// оператора тихо забывают простаивающий сокет за пару минут. Радио при
-// включённом экране и так активно, поэтому keepalive чаще почти бесплатен.
-pub const BRIDGE_PING_INTERVAL_SCREEN_ON: Duration = Duration::from_secs(45);
-pub const BRIDGE_WATCHDOG_TICK: Duration = Duration::from_secs(20);
-pub static SCREEN_ON: AtomicBool = AtomicBool::new(true);
-// Если прямой WS не ответил за это время — параллельно стартуем fronting.
-pub const FRONTING_HEDGE_DELAY: Duration = Duration::from_millis(2500);
 // Потолок на перебор CF-доменов для одного соединения.
 pub const CFPROXY_ACQUIRE_DEADLINE: Duration = Duration::from_secs(20);
 pub const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);

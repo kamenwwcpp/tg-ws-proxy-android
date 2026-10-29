@@ -196,34 +196,7 @@ pub extern "C" fn NetworkChanged() -> c_int {
     runtime().spawn(async move {
         pools.reset().await;
     });
-    // Сессии TG, идущие через старую сеть, проверяем сразу: мёртвые закроются
-    // за BRIDGE_PONG_TIMEOUT, и TG переподключится, не дожидаясь своих таймаутов.
-    let n = proxy::probe_all_bridges();
-    if n > 0 {
-        linfo!("Network changed: probing {} active session(s)", n);
-    }
     0
-}
-
-/// Телефон проснулся / экран включили после долгого сна: проверить, живы ли
-/// апстримы активных сессий, пока пользователь открывает TG. Пингуются только
-/// сессии, молчавшие дольше BRIDGE_PROBE_IDLE.
-#[unsafe(no_mangle)]
-pub extern "C" fn ProbeConnections() -> c_int {
-    if state_cell().lock().is_none() {
-        return -1;
-    }
-    let n = proxy::probe_all_bridges();
-    if n > 0 {
-        ldebug!("Wakeup: probing {} active session(s)", n);
-    }
-    n as c_int
-}
-
-/// Экран вкл/выкл: при включённом keepalive-пинги чаще (радио и так активно).
-#[unsafe(no_mangle)]
-pub extern "C" fn SetScreenOn(v: c_int) {
-    SCREEN_ON.store(v != 0, Ordering::Relaxed);
 }
 
 #[unsafe(no_mangle)]

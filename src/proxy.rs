@@ -8,7 +8,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,54 +29,6 @@ pub fn ws_pool_fronting_first() -> bool {
 
 pub fn set_ws_pool_fronting_first(v: bool) {
     TRY_FRONTING_FIRST.store(v, Ordering::Relaxed);
-}
-
-// ---------------------------------------------------------------------------
-// Живость сессий. Мост, у которого апстрим молча умер (сон телефона, NAT
-// оператора, смена сети), иначе жил до BRIDGE_READ_TIMEOUT, а TG всё это
-// время ждал ответа — отсюда «помогает только перезапуск TG».
-// ---------------------------------------------------------------------------
-
-static BRIDGE_SEQ: AtomicU64 = AtomicU64::new(1);
-static BRIDGES: once_cell::sync::Lazy<parking_lot::Mutex<HashMap<u64, Arc<tokio::sync::Notify>>>> =
-    once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
-
-struct BridgeRegistration(u64);
-
-impl BridgeRegistration {
-    fn new(probe: Arc<tokio::sync::Notify>) -> Self {
-        let id = BRIDGE_SEQ.fetch_add(1, Ordering::Relaxed);
-        BRIDGES.lock().insert(id, probe);
-        BridgeRegistration(id)
-    }
-}
-
-impl Drop for BridgeRegistration {
-    fn drop(&mut self) {
-        BRIDGES.lock().remove(&self.0);
-    }
-}
-
-/// Попросить все активные мосты проверить апстрим (пробуждение, смена сети).
-/// Мост пингует только если апстрим молчал дольше BRIDGE_PROBE_IDLE.
-pub fn probe_all_bridges() -> usize {
-    let map = BRIDGES.lock();
-    for n in map.values() {
-        n.notify_one();
-    }
-    map.len()
-}
-
-// Пуловые WS, созданные раньше этой отметки, считаются мёртвыми: если один
-// простаивавший сокет умер молча, его соседи по той же сети почти наверняка тоже.
-static POOL_STALE_BEFORE: AtomicU64 = AtomicU64::new(0);
-
-pub fn mark_pool_stale() {
-    POOL_STALE_BEFORE.store(now_monotonic().to_bits(), Ordering::Relaxed);
-}
-
-fn pool_entry_stale(created: f64) -> bool {
-    created < f64::from_bits(POOL_STALE_BEFORE.load(Ordering::Relaxed))
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +178,6 @@ impl WsPool {
             while let Some(entry) = q.pop_front() {
                 let age = now - entry.created;
                 if age > WS_POOL_REUSE_MAX_AGE
-                    || pool_entry_stale(entry.created)
                     || entry.ws.peer_closed()
                 {
                     let e = entry;
@@ -447,7 +398,6 @@ impl WsPool {
                 let mut expired = Vec::new();
                 while let Some(e) = q.pop_front() {
                     if now - e.created >= WS_POOL_REUSE_MAX_AGE
-                        || pool_entry_stale(e.created)
                         || e.ws.peer_closed()
                     {
                         expired.push(e.ws);
@@ -861,7 +811,7 @@ pub async fn bridge_ws<R, W>(
     mut tg_enc: TrackedStream,
     mut tg_dec: TrackedStream,
     cancel_token: CancellationToken,
-    check_liveness: bool,
+    _check_liveness: bool,
 ) where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
@@ -876,75 +826,40 @@ pub async fn bridge_ws<R, W>(
     let mut conn_read = conn_read;
     let mut conn_write = conn_write;
 
-    // Сторож апстрима. Раньше пинг уходил «в никуда»: ответ не проверялся, и
-    // мёртвый после сна/смены сети WS держал TG до 5 минут.
-    let probe = Arc::new(tokio::sync::Notify::new());
-    let _registration = BridgeRegistration::new(probe.clone());
-    let close_reason_wd = Arc::new(Mutex::new(String::new()));
+    let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
+
+    // Keepalive ровно как в 1.3.1: ping только после BRIDGE_PING_INTERVAL
+    // тишины в обе стороны, ответ не проверяем. В 1.3.2 пинги каждые 45s и
+    // разрыв по отсутствию pong ухудшили мобильный интернет; у Flowseal частые
+    // пинги (30s) тоже рвали сессии и были откачены (#925 -> #1036).
     let ws_ping = ws.clone();
-    let probe_wd = probe.clone();
+    let la_ping = last_activity.clone();
     let cancel_ping = cancel.clone();
     let cancel_token_ping = cancel_token.clone();
-    let close_reason_wd_c = close_reason_wd.clone();
     let ping_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(BRIDGE_PING_INTERVAL / 2);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
         loop {
-            let requested = tokio::select! {
+            tokio::select! {
                 _ = cancel_token_ping.cancelled() => return,
                 _ = cancel_ping.cancelled() => return,
-                _ = probe_wd.notified() => true,
-                _ = tokio::time::sleep(BRIDGE_WATCHDOG_TICK) => false,
-            };
-            let idle = ws_ping.rx_idle();
-            let threshold = if requested {
-                BRIDGE_PROBE_IDLE
-            } else if SCREEN_ON.load(Ordering::Relaxed) {
-                BRIDGE_PING_INTERVAL_SCREEN_ON
-            } else {
-                BRIDGE_PING_INTERVAL
-            };
-            if idle < threshold {
-                continue;
-            }
-            let seq_before = ws_ping.rx_seq();
-            if ws_ping.send_ping().await.is_err() {
-                *close_reason_wd_c.lock().await = "upstream: ping_failed".to_string();
-                if check_liveness {
-                    mark_pool_stale();
+                _ = interval.tick() => {
+                    let idle = la_ping.lock().await.elapsed();
+                    if idle > BRIDGE_PING_INTERVAL {
+                        if ws_ping.send_ping().await.is_err() {
+                            cancel_ping.cancel();
+                            return;
+                        }
+                    }
                 }
-                cancel_ping.cancel();
-                return;
-            }
-            if !check_liveness {
-                continue;
-            }
-            // Ждём любой входящий фрейм (pong или данные). Таймер tokio идёт
-            // только пока CPU не спит, так что сон телефона ложной смерти не даёт.
-            let alive = tokio::time::timeout(BRIDGE_PONG_TIMEOUT, async {
-                while ws_ping.rx_seq() == seq_before {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-            });
-            let alive = tokio::select! {
-                _ = cancel_token_ping.cancelled() => return,
-                _ = cancel_ping.cancelled() => return,
-                r = alive => r.is_ok(),
-            };
-            if !alive {
-                *close_reason_wd_c.lock().await = format!(
-                    "upstream: no pong in {}s (idle {:.0}s)",
-                    BRIDGE_PONG_TIMEOUT.as_secs(),
-                    idle.as_secs_f64()
-                );
-                mark_pool_stale();
-                cancel_ping.cancel();
-                return;
             }
         }
     });
 
     // up: client -> ws
     let ws_up = ws.clone();
-    let probe_up = probe.clone();
+    let la_up = last_activity.clone();
     let cancel_up = cancel.clone();
     let cancel_token_up = cancel_token.clone();
     let up_bytes = Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -997,11 +912,7 @@ pub async fn bridge_ws<R, W>(
             STATS.bytes_up.fetch_add(n as i64, Ordering::Relaxed);
             up_bytes_c.fetch_add(n as i64, Ordering::Relaxed);
             up_packets_c.fetch_add(1, Ordering::Relaxed);
-            // TG снова говорит после долгой тишины апстрима (вышел из фона,
-            // телефон проснулся) — пусть сторож проверит, жив ли WS.
-            if ws_up.rx_idle() >= BRIDGE_PROBE_IDLE {
-                probe_up.notify_one();
-            }
+            *la_up.lock().await = std::time::Instant::now();
 
             clt_dec.xor(chunk);
             tg_enc.xor(chunk);
@@ -1030,6 +941,7 @@ pub async fn bridge_ws<R, W>(
 
     // down: ws -> client
     let ws_down = ws.clone();
+    let la_down = last_activity.clone();
     let cancel_down = cancel.clone();
     let cancel_token_down = cancel_token.clone();
     let down_bytes = Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -1065,10 +977,12 @@ pub async fn bridge_ws<R, W>(
             STATS.bytes_down.fetch_add(n as i64, Ordering::Relaxed);
             down_bytes_c.fetch_add(n as i64, Ordering::Relaxed);
             down_packets_c.fetch_add(1, Ordering::Relaxed);
+            *la_down.lock().await = std::time::Instant::now();
 
             tg_dec.xor(&mut data);
             clt_enc.xor(&mut data);
-            if conn_write.write_all(&data).await.is_err() {
+            let wr = conn_write.write_all(&data).await;
+            if wr.is_err() {
                 *close_reason_down_c.lock().await = "client: write_failed".to_string();
                 break;
             }
@@ -1084,10 +998,7 @@ pub async fn bridge_ws<R, W>(
     let close_reason = {
         let up_r = close_reason_up.lock().await.clone();
         let down_r = close_reason_down.lock().await.clone();
-        let wd_r = close_reason_wd.lock().await.clone();
-        if !wd_r.is_empty() {
-            wd_r
-        } else if !down_r.is_empty() {
+        if !down_r.is_empty() {
             down_r
         } else if !up_r.is_empty() {
             up_r
@@ -2260,12 +2171,8 @@ pub enum DirectOutcome {
     Failed(WsError),
 }
 
-/// Прямой WS с «хеджированием» fronting'ом. Раньше: прямой до таймаута (5s),
-/// и только потом fronting (до 7s) — 12s на коннект, TG успевал сдаться.
-/// Теперь, если прямой не ответил за FRONTING_HEDGE_DELAY, fronting стартует
-/// параллельно, побеждает первый. На Wi-Fi прямой отвечает раньше задержки,
-/// второго соединения не возникает. Таймаут/ошибки прямого — как раньше:
-/// fronting пробуется только при таймауте, редиректы/ошибки уходят наверх.
+/// Прямой WS; при таймауте — fronting (как в 1.3.1, последовательно).
+/// Редиректы и прочие ошибки прямого уходят наверх без fronting.
 async fn connect_direct_hedged(
     target: &str,
     domain: &str,
@@ -2283,40 +2190,16 @@ async fn connect_direct_hedged(
             Err(e) => DirectOutcome::Failed(e),
         };
     }
-    tokio::select! {
-        r = &mut direct => {
-            return match r {
-                Ok(ws) => DirectOutcome::Direct(ws),
-                Err(WsError::Timeout) => match connect_fronted(target, domain, ws_path).await {
-                    Some(ws) => DirectOutcome::Fronted(ws),
-                    None => DirectOutcome::Failed(WsError::Timeout),
-                },
-                Err(e) => DirectOutcome::Failed(e),
-            };
-        }
-        _ = tokio::time::sleep(FRONTING_HEDGE_DELAY) => {}
-    }
-    let fronted = connect_fronted(target, domain, ws_path);
-    tokio::pin!(fronted);
-    tokio::select! {
-        r = &mut direct => match r {
-            Ok(ws) => DirectOutcome::Direct(ws),
-            Err(WsError::Timeout) => match fronted.await {
-                Some(ws) => DirectOutcome::Fronted(ws),
-                None => DirectOutcome::Failed(WsError::Timeout),
-            },
-            Err(e) => match fronted.await {
-                Some(ws) => DirectOutcome::Fronted(ws),
-                None => DirectOutcome::Failed(e),
-            },
-        },
-        f = &mut fronted => match f {
+    // Как в 1.3.1: fronting только после таймаута прямого. Параллельный старт
+    // (1.3.2) на LTE часто отдавал победу fronting'у при живом, но медленном
+    // прямом пути и переключал на него все следующие соединения — хуже.
+    match direct.await {
+        Ok(ws) => DirectOutcome::Direct(ws),
+        Err(WsError::Timeout) => match connect_fronted(target, domain, ws_path).await {
             Some(ws) => DirectOutcome::Fronted(ws),
-            None => match direct.await {
-                Ok(ws) => DirectOutcome::Direct(ws),
-                Err(e) => DirectOutcome::Failed(e),
-            },
+            None => DirectOutcome::Failed(WsError::Timeout),
         },
+        Err(e) => DirectOutcome::Failed(e),
     }
 }
 
