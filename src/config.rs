@@ -269,6 +269,228 @@ pub fn clear_failure_state() {
 pub static ZERO64: [u8; 64] = [0u8; 64];
 
 // ---------------------------------------------------------------------------
+// Состояние сети от Android (идея форка crim50n). «Интернет подтверждён»
+// (NET_CAPABILITY_VALIDATED) намеренно НЕ используем: в РФ проверка Android
+// часто не проходит при рабочем интернете. Только «есть ли сеть вообще».
+// По умолчанию сеть считается доступной — если Android ничего не сообщил,
+// поведение как раньше.
+// ---------------------------------------------------------------------------
+
+pub const NET_KIND_UNKNOWN: i32 = 0;
+pub const NET_KIND_WIFI: i32 = 1;
+pub const NET_KIND_CELLULAR: i32 = 2;
+
+pub static NET_AVAILABLE: AtomicBool = AtomicBool::new(true);
+pub static NET_KIND: AtomicI32 = AtomicI32::new(NET_KIND_UNKNOWN);
+// Растёт при каждой смене сети/пропадании: результаты попыток, начатых в
+// прошлой «эпохе», не записываются в блокировки.
+pub static NET_EPOCH: AtomicI64 = AtomicI64::new(0);
+
+pub fn net_available() -> bool {
+    NET_AVAILABLE.load(Ordering::Relaxed)
+}
+
+pub fn net_epoch() -> i64 {
+    NET_EPOCH.load(Ordering::Relaxed)
+}
+
+pub fn net_kind_name(kind: i32) -> &'static str {
+    match kind {
+        NET_KIND_WIFI => "Wi-Fi",
+        NET_KIND_CELLULAR => "моб. сеть",
+        3 => "Ethernet",
+        4 => "VPN/другая",
+        _ => "неизвестная",
+    }
+}
+
+/// Можно ли записывать провал попытки, начатой в эпоху `epoch`, в блокировки:
+/// сеть есть и не менялась с начала попытки. Иначе провал — следствие того,
+/// что сети не было, а не того, что маршрут плохой.
+pub fn failure_counts(epoch: i64) -> bool {
+    net_available() && net_epoch() == epoch
+}
+
+// ---------------------------------------------------------------------------
+// Предохранитель прямого WS для медиа (порт DirectWsCircuitBreaker из
+// crim50n). ТСПУ на мобильном интернете часто не рвёт медиа-соединение, а
+// «душит»: запрос ушёл, ответа нет. Зависание -> прямой WS для этого DC/медиа
+// временно не используем, медиа идёт через fallback (TCP/CF).
+// Состояние хранится отдельно для каждого типа сети и НЕ сбрасывается при
+// переключении: вернулся на LTE, где душили медиа, — сразу обход; на Wi-Fi
+// при этом прямой путь.
+// ---------------------------------------------------------------------------
+
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(15);
+pub const STALL_MIN_PENDING_UP: i64 = 1024;
+pub const STALL_MIN_MEANINGFUL_DOWN: i64 = 4096;
+pub const BREAKER_RETRY_BLOCK: f64 = 60.0;
+pub const BREAKER_LONG_BLOCK: f64 = 600.0;
+pub const BREAKER_STRIKE_WINDOW: f64 = 300.0;
+pub const BREAKER_STRIKES_TO_LONG: u32 = 2;
+
+#[derive(Clone, Copy)]
+struct BreakerState {
+    strikes: u32,
+    last_stall: f64,
+    blocked_until: f64,
+}
+
+static DIRECT_BREAKER: Lazy<parking_lot::Mutex<HashMap<(i32, DcKey), BreakerState>>> =
+    Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+/// Сколько ещё секунд прямой WS для dc_key заблокирован в текущем типе сети.
+pub fn breaker_blocked_for(dc_key: DcKey) -> f64 {
+    let kind = NET_KIND.load(Ordering::Relaxed);
+    let now = now_monotonic();
+    let mut map = DIRECT_BREAKER.lock();
+    match map.get(&(kind, dc_key)).copied() {
+        Some(s) if s.blocked_until > now => s.blocked_until - now,
+        Some(s) => {
+            if now - s.last_stall > BREAKER_STRIKE_WINDOW {
+                map.remove(&(kind, dc_key));
+            }
+            0.0
+        }
+        None => 0.0,
+    }
+}
+
+/// Зафиксировать зависание. Возвращает (номер зависания подряд, блок в секундах).
+pub fn breaker_record_stall(dc_key: DcKey) -> (u32, f64) {
+    let kind = NET_KIND.load(Ordering::Relaxed);
+    let now = now_monotonic();
+    let mut map = DIRECT_BREAKER.lock();
+    let prev = map.get(&(kind, dc_key)).copied();
+    if let Some(p) = prev {
+        if p.blocked_until > now {
+            return (p.strikes, p.blocked_until - now);
+        }
+    }
+    let strikes = match prev {
+        Some(p) if now - p.last_stall <= BREAKER_STRIKE_WINDOW => p.strikes + 1,
+        _ => 1,
+    };
+    let block = if strikes >= BREAKER_STRIKES_TO_LONG {
+        BREAKER_LONG_BLOCK
+    } else {
+        BREAKER_RETRY_BLOCK
+    };
+    map.insert(
+        (kind, dc_key),
+        BreakerState {
+            strikes,
+            last_stall: now,
+            blocked_until: now + block,
+        },
+    );
+    (strikes, block)
+}
+
+/// Прямой WS ответил осмысленным объёмом — снимаем счётчик (если не в блоке).
+pub fn breaker_record_responsive(dc_key: DcKey) {
+    let kind = NET_KIND.load(Ordering::Relaxed);
+    let now = now_monotonic();
+    let mut map = DIRECT_BREAKER.lock();
+    if let Some(s) = map.get(&(kind, dc_key)) {
+        if s.blocked_until <= now {
+            map.remove(&(kind, dc_key));
+        }
+    }
+}
+
+pub fn breaker_clear_all() {
+    DIRECT_BREAKER.lock().clear();
+    DIRECT_BAD.lock().clear();
+    FRONTING_BAD.lock().clear();
+}
+
+// ---------------------------------------------------------------------------
+// Память «прямой WS к этому IP не отвечает» по типу сети (автовыбор маршрута).
+// На LTE прямой путь у многих операторов режется целиком: каждая попытка —
+// ~12s (таймаут 5s + fronting 7s), TG за это время сдаётся. Поэтому на
+// мобильной сети блок ставится с первого таймаута и на 5 минут (как в 1.3.1),
+// а на Wi-Fi остаётся мягкая схема (2 таймаута, 2 минуты). Запись живёт
+// отдельно от IP_FAIL_UNTIL и НЕ сбрасывается при смене сети: вернулся на LTE
+// — сразу fallback, без новой волны 12-секундных попыток. Снимается, как
+// только пул или прямое подключение в этом типе сети прошли успешно.
+// ---------------------------------------------------------------------------
+
+// Память на LTE живёт до 30 минут, но снимается сразу, как только пул (он
+// пробует прямой путь в фоне, TG его не ждёт) или прямое подключение прошли.
+// Иначе каждые 5 минут блок истекал и TG ловил новую волну 12-секундных попыток.
+pub const DIRECT_BAD_TTL_CELLULAR: f64 = 1800.0;
+pub const IP_FAIL_COOLDOWN_CELLULAR: f64 = 300.0;
+
+// Fronting (SNI sprinthost.ru) на этом типе сети недавно не прошёл — не тратим
+// на него WS_POOL_FRONTING_TIMEOUT (7s) на каждом подключении.
+pub const FRONTING_BAD_TTL: f64 = 600.0;
+static FRONTING_BAD: Lazy<parking_lot::Mutex<HashMap<i32, f64>>> =
+    Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+pub fn fronting_bad_active() -> bool {
+    let kind = NET_KIND.load(Ordering::Relaxed);
+    FRONTING_BAD
+        .lock()
+        .get(&kind)
+        .map(|until| now_monotonic() < *until)
+        .unwrap_or(false)
+}
+
+pub fn fronting_mark(ok: bool) {
+    let kind = NET_KIND.load(Ordering::Relaxed);
+    let mut map = FRONTING_BAD.lock();
+    if ok {
+        map.remove(&kind);
+    } else {
+        map.insert(kind, now_monotonic() + FRONTING_BAD_TTL);
+    }
+}
+
+static DIRECT_BAD: Lazy<parking_lot::Mutex<HashMap<(i32, String), f64>>> =
+    Lazy::new(|| parking_lot::Mutex::new(HashMap::new()));
+
+pub fn is_cellular() -> bool {
+    NET_KIND.load(Ordering::Relaxed) == NET_KIND_CELLULAR
+}
+
+/// Сколько таймаутов подряд нужно для блока и на сколько секунд — по типу сети.
+/// (таймаутов подряд для блока, cooldown IP, срок памяти по типу сети).
+pub fn ip_fail_policy() -> (u32, f64, f64) {
+    if is_cellular() {
+        (1, IP_FAIL_COOLDOWN_CELLULAR, DIRECT_BAD_TTL_CELLULAR)
+    } else {
+        (IP_FAIL_STRIKES, IP_FAIL_COOLDOWN, IP_FAIL_COOLDOWN)
+    }
+}
+
+pub fn direct_bad_mark(ip: &str, until: f64) {
+    let kind = NET_KIND.load(Ordering::Relaxed);
+    DIRECT_BAD.lock().insert((kind, ip.to_string()), until);
+}
+
+/// Прямой путь к ip в текущем типе сети помечен нерабочим.
+pub fn direct_bad_active(ip: &str) -> bool {
+    let kind = NET_KIND.load(Ordering::Relaxed);
+    let now = now_monotonic();
+    let mut map = DIRECT_BAD.lock();
+    match map.get(&(kind, ip.to_string())).copied() {
+        Some(until) if until > now => true,
+        Some(_) => {
+            map.remove(&(kind, ip.to_string()));
+            false
+        }
+        None => false,
+    }
+}
+
+/// Прямой путь к ip в текущем типе сети заработал — снимаем память.
+pub fn direct_bad_clear(ip: &str) -> bool {
+    let kind = NET_KIND.load(Ordering::Relaxed);
+    DIRECT_BAD.lock().remove(&(kind, ip.to_string())).is_some()
+}
+
+// ---------------------------------------------------------------------------
 // Domain validation — proxy/config.py::_is_valid_domain / _normalize_domain_pool
 // ---------------------------------------------------------------------------
 

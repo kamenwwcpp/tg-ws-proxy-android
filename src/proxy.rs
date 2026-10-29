@@ -215,6 +215,10 @@ impl WsPool {
         target_ip: String,
         domains: Vec<String>,
     ) {
+        // Нет сети — не пытаемся (и не копим backoff), get() позовёт снова.
+        if !net_available() {
+            return;
+        }
         // Backoff как в оригинале: не раньше _refill_after.
         {
             let failures = self.refill_failures.lock().await;
@@ -248,6 +252,7 @@ impl WsPool {
         target_ip: String,
         domains: Vec<String>,
     ) {
+        let epoch = net_epoch();
         let _guard = RefillGuard {
             state: state.clone(),
         };
@@ -295,8 +300,13 @@ impl WsPool {
                 linfo!("WS pool reached {}: cooldown cleared", target_ip);
             }
             IP_TIMEOUT_STRIKES.write().remove(&target_ip);
+            if failure_counts(epoch) && direct_bad_clear(&target_ip) {
+                linfo!("WS pool reached {}: прямой путь снова работает ({})", target_ip, net_kind_name(NET_KIND.load(Ordering::Relaxed)));
+            }
             self.report_success(slot.dc, slot.is_media != 0).await;
             self.schedule_rotation(slot, target_ip, domains).await;
+        } else if !failure_counts(epoch) {
+            // Сеть пропала/сменилась во время пополнения — backoff не наращиваем.
         } else {
             // Экспоненциальный backoff 1s..3600s как в оригинале.
             let mut failures = self.refill_failures.lock().await;
@@ -798,6 +808,68 @@ pub fn is_http_transport(data: &[u8]) -> bool {
 // Сессионная статистика как в bridge_ws_reencrypt оригинала.
 // ---------------------------------------------------------------------------
 
+/// Окно «запрос без ответа» для детектора зависания медиа.
+#[derive(Default)]
+struct StallWindow {
+    pending_since: Option<std::time::Instant>,
+    up: i64,
+    down: i64,
+    last_down: Option<std::time::Instant>,
+}
+
+impl StallWindow {
+    fn reset(&mut self) {
+        self.pending_since = None;
+        self.up = 0;
+        self.down = 0;
+    }
+
+    fn on_request(&mut self, n: i64) {
+        let now = std::time::Instant::now();
+        // TG уже получил что-то после открытия окна — это новый запрос.
+        let answered = match (self.pending_since, self.last_down) {
+            (Some(since), Some(last)) => last >= since,
+            _ => false,
+        };
+        if self.pending_since.is_none() || answered {
+            self.pending_since = Some(now);
+            self.up = 0;
+            self.down = 0;
+        }
+        self.up += n;
+    }
+
+    /// true — пришёл осмысленный ответ, прямой WS отвечает.
+    fn on_response(&mut self, n: i64) -> bool {
+        self.last_down = Some(std::time::Instant::now());
+        if self.pending_since.is_some() {
+            self.down += n;
+            if self.down >= STALL_MIN_MEANINGFUL_DOWN {
+                self.reset();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_stalled(&self) -> Option<(i64, i64)> {
+        let since = self.pending_since?;
+        if since.elapsed() < STALL_TIMEOUT
+            || self.up < STALL_MIN_PENDING_UP
+            || self.down >= STALL_MIN_MEANINGFUL_DOWN
+        {
+            return None;
+        }
+        // Вниз должно молчать столько же: медленный, но идущий поток — не зависание.
+        if let Some(last) = self.last_down {
+            if last.elapsed() < STALL_TIMEOUT {
+                return None;
+            }
+        }
+        Some((self.up, self.down))
+    }
+}
+
 pub async fn bridge_ws<R, W>(
     conn_read: R,
     conn_write: W,
@@ -811,7 +883,7 @@ pub async fn bridge_ws<R, W>(
     mut tg_enc: TrackedStream,
     mut tg_dec: TrackedStream,
     cancel_token: CancellationToken,
-    _check_liveness: bool,
+    stall_key: Option<DcKey>,
 ) where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
@@ -827,6 +899,58 @@ pub async fn bridge_ws<R, W>(
     let mut conn_write = conn_write;
 
     let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
+
+    // Детектор зависания медиа (только медиа по прямому WS, stall_key = Some).
+    // Окно «запрос без ответа»: открывается на данных от TG, закрывается, когда
+    // пришло >= STALL_MIN_MEANINGFUL_DOWN. Если TG что-то получил после открытия
+    // окна, новый запрос открывает окно заново (иначе мелкий ответ + долгая
+    // пауза давали бы ложное зависание). Зависание: окно старше STALL_TIMEOUT,
+    // запросов >= STALL_MIN_PENDING_UP, ответа < порога и вниз тишина.
+    // Instant и таймеры tokio идут только пока CPU не спит — сон не даёт
+    // ложных срабатываний.
+    let stall = stall_key.map(|_| Arc::new(parking_lot::Mutex::new(StallWindow::default())));
+    let close_reason_stall = Arc::new(Mutex::new(String::new()));
+    let stall_task = match (stall_key, stall.clone()) {
+        (Some(key), Some(stall_w)) => {
+            let cancel_st = cancel.clone();
+            let cancel_token_st = cancel_token.clone();
+            let reason = close_reason_stall.clone();
+            let label_st = label.clone();
+            let epoch_start = net_epoch();
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        _ = cancel_token_st.cancelled() => return,
+                        _ = cancel_st.cancelled() => return,
+                        _ = interval.tick() => {}
+                    }
+                    if !failure_counts(epoch_start) {
+                        // Сети нет или она сменилась — это не «душат медиа».
+                        stall_w.lock().reset();
+                        continue;
+                    }
+                    let stalled = {
+                        let w = stall_w.lock();
+                        w.is_stalled()
+                    };
+                    let Some((up, down)) = stalled else { continue };
+                    let (strikes, block) = breaker_record_stall(key);
+                    let msg = format!(
+                        "медиа зависло: ^{}B без ответа (v{}B) {}s; прямой WS в обход на {:.0}s ({}, зависание #{})",
+                        up, down, STALL_TIMEOUT.as_secs(), block,
+                        net_kind_name(NET_KIND.load(Ordering::Relaxed)), strikes
+                    );
+                    lwarn!("[{}] {}", label_st, msg);
+                    *reason.lock().await = "upstream: media stall".to_string();
+                    cancel_st.cancel();
+                    return;
+                }
+            }))
+        }
+        _ => None,
+    };
 
     // Keepalive ровно как в 1.3.1: ping только после BRIDGE_PING_INTERVAL
     // тишины в обе стороны, ответ не проверяем. В 1.3.2 пинги каждые 45s и
@@ -860,6 +984,7 @@ pub async fn bridge_ws<R, W>(
     // up: client -> ws
     let ws_up = ws.clone();
     let la_up = last_activity.clone();
+    let stall_up = stall.clone();
     let cancel_up = cancel.clone();
     let cancel_token_up = cancel_token.clone();
     let up_bytes = Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -913,6 +1038,9 @@ pub async fn bridge_ws<R, W>(
             up_bytes_c.fetch_add(n as i64, Ordering::Relaxed);
             up_packets_c.fetch_add(1, Ordering::Relaxed);
             *la_up.lock().await = std::time::Instant::now();
+            if let Some(w) = &stall_up {
+                w.lock().on_request(n as i64);
+            }
 
             clt_dec.xor(chunk);
             tg_enc.xor(chunk);
@@ -942,6 +1070,7 @@ pub async fn bridge_ws<R, W>(
     // down: ws -> client
     let ws_down = ws.clone();
     let la_down = last_activity.clone();
+    let stall_down = stall.clone();
     let cancel_down = cancel.clone();
     let cancel_token_down = cancel_token.clone();
     let down_bytes = Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -978,6 +1107,14 @@ pub async fn bridge_ws<R, W>(
             down_bytes_c.fetch_add(n as i64, Ordering::Relaxed);
             down_packets_c.fetch_add(1, Ordering::Relaxed);
             *la_down.lock().await = std::time::Instant::now();
+            if let Some(w) = &stall_down {
+                let responsive = w.lock().on_response(n as i64);
+                if responsive {
+                    if let Some(k) = stall_key {
+                        breaker_record_responsive(k);
+                    }
+                }
+            }
 
             tg_dec.xor(&mut data);
             clt_enc.xor(&mut data);
@@ -994,11 +1131,17 @@ pub async fn bridge_ws<R, W>(
     let _ = down_task.await;
     cancel.cancel();
     ping_task.abort();
+    if let Some(t) = stall_task {
+        t.abort();
+    }
 
     let close_reason = {
         let up_r = close_reason_up.lock().await.clone();
         let down_r = close_reason_down.lock().await.clone();
-        if !down_r.is_empty() {
+        let stall_r = close_reason_stall.lock().await.clone();
+        if !stall_r.is_empty() {
+            stall_r
+        } else if !down_r.is_empty() {
             down_r
         } else if !up_r.is_empty() {
             up_r
@@ -1052,7 +1195,7 @@ pub async fn bridge_ws_stream(
         tg_enc,
         tg_dec,
         cancel_token,
-        true,
+        None,
     )
     .await;
 }
@@ -1194,6 +1337,9 @@ fn note_connection_success() {
 }
 
 async fn note_connection_failure(pools: &ProxyPools) {
+    if !net_available() {
+        return;
+    }
     let streak = FAIL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
     if streak < AUTO_RESET_FAIL_STREAK {
         return;
@@ -1209,6 +1355,7 @@ async fn note_connection_failure(pools: &ProxyPools) {
     FAIL_STREAK.store(0, Ordering::Relaxed);
     lwarn!("{} подключений подряд без маршрута -> сброс блокировок и пула", streak);
     reset_route_state();
+    breaker_clear_all();
     pools.reset().await;
 }
 
@@ -1240,10 +1387,32 @@ fn tcp_backoff_fail(key: &str) -> f64 {
 // halves уходят дальше в CF.
 async fn tcp_connect_fallback(dst: &str, port: u16, init: &[u8], label: &str) -> Option<TcpStream> {
     let addr = format!("{}:{}", dst, port);
+    let epoch = net_epoch();
     if tcp_backoff_active(&addr) {
         ldebug!("[{}] TCP fallback to {} skipped (backoff)", label, addr);
         return None;
     }
+    // Single-flight (как у Alexingin / Flowseal 50c980e): пока к адресу уже идёт
+    // попытка, остальные не ждут свои 4s таймаута, а сразу идут дальше (в CF).
+    // На LTE было 16 одновременных попыток к одному заблокированному адресу.
+    // Адрес, к которому TCP уже проходил, не ограничиваем: там параллельные
+    // подключения — норма (например, DC1/3/5 на Wi-Fi).
+    static TCP_CONNECTING: once_cell::sync::Lazy<parking_lot::Mutex<HashSet<String>>> =
+        once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashSet::new()));
+    static TCP_KNOWN_OK: once_cell::sync::Lazy<parking_lot::Mutex<HashSet<String>>> =
+        once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(HashSet::new()));
+    let known_ok = TCP_KNOWN_OK.lock().contains(&addr);
+    if !TCP_CONNECTING.lock().insert(addr.clone()) && !known_ok {
+        ldebug!("[{}] TCP fallback to {} skipped (already connecting)", label, addr);
+        return None;
+    }
+    struct ConnectingGuard(String);
+    impl Drop for ConnectingGuard {
+        fn drop(&mut self) {
+            TCP_CONNECTING.lock().remove(&self.0);
+        }
+    }
+    let _connecting = ConnectingGuard(addr.clone());
     let res = tokio::time::timeout(TCP_CONNECT_TIMEOUT, async {
         let mut remote = TcpStream::connect(&addr).await?;
         let _ = remote.set_nodelay(true);
@@ -1254,14 +1423,23 @@ async fn tcp_connect_fallback(dst: &str, port: u16, init: &[u8], label: &str) ->
     match res {
         Ok(Ok(remote)) => {
             TCP_BACKOFF.lock().remove(&addr);
+            TCP_KNOWN_OK.lock().insert(addr.clone());
             Some(remote)
         }
         Ok(Err(e)) => {
+            TCP_KNOWN_OK.lock().remove(&addr);
+            if !failure_counts(epoch) {
+                return None;
+            }
             let delay = tcp_backoff_fail(&addr);
             lwarn!("[{}] TCP fallback to {} failed: {}; retry in {:.0}s", label, addr, e, delay);
             None
         }
         Err(_) => {
+            TCP_KNOWN_OK.lock().remove(&addr);
+            if !failure_counts(epoch) {
+                return None;
+            }
             let delay = tcp_backoff_fail(&addr);
             lwarn!("[{}] TCP fallback to {} failed: timeout; retry in {:.0}s", label, addr, delay);
             None
@@ -1545,8 +1723,7 @@ where
                     tg_enc.clone_state(),
                     tg_dec.clone_state(),
                     cancel_token,
-                    // Чужой worker может не отвечать на ping — не рвём по pong.
-                    false,
+                    None,
                 )
                 .await;
                 return true;
@@ -1579,7 +1756,7 @@ where
                     tg_enc.clone_state(),
                     tg_dec.clone_state(),
                     cancel_token,
-                    true,
+                    None,
                 )
                 .await;
                 return true;
@@ -1771,7 +1948,24 @@ async fn serve_core<R, W>(
     let proto = LittleEndian::read_u32(proto_tag);
     if !valid_proto(proto) {
         STATS.connections_bad.fetch_add(1, Ordering::Relaxed);
-        lwarn!("[{}] bad handshake (wrong secret or proto)", label);
+        // Клиент со старым секретом (осталась старая запись прокси в TG, его
+        // «автопереключение») шлёт десятки тысяч подключений: лог на каждое
+        // забивал буфер и грел CPU. Пишем не чаще раза в 10s со счётчиком.
+        static BAD_LOGGED: AtomicI32 = AtomicI32::new(0);
+        static BAD_LAST: parking_lot::Mutex<f64> = parking_lot::Mutex::new(f64::NEG_INFINITY);
+        let suppressed = BAD_LOGGED.fetch_add(1, Ordering::Relaxed);
+        let now_t = now_monotonic();
+        let mut last = BAD_LAST.lock();
+        if now_t - *last >= 10.0 {
+            *last = now_t;
+            BAD_LOGGED.store(0, Ordering::Relaxed);
+            drop(last);
+            lwarn!(
+                "[{}] bad handshake (wrong secret or proto){} — в Telegram, вероятно, старая запись прокси со старым секретом",
+                label,
+                if suppressed > 0 { format!(", ещё {} за 10s", suppressed) } else { String::new() }
+            );
+        }
         return;
     }
 
@@ -1805,6 +1999,17 @@ async fn serve_core<R, W>(
         proto_int,
         if is_test_dc { " test" } else { "" }
     );
+
+    // Сети нет (Android сообщил onLost): попытки заведомо провалятся и только
+    // накопят блокировки. Закрываем сразу — TG переподключится, когда сеть
+    // появится.
+    if !net_available() {
+        ldebug!("[{}] DC{}{} нет сети -> закрываю без попыток", label, dc, m_tag);
+        return;
+    }
+    // Эпоха сети на момент начала: провалы, случившиеся уже после смены сети,
+    // в блокировки не пишем.
+    let epoch = net_epoch();
 
     // relayInit генерация (1-в-1 c Go + RESERVED из utils.py).
     let mut relay_init = [0u8; 64];
@@ -1870,19 +2075,37 @@ async fn serve_core<R, W>(
         false
     } else {
         IP_FAIL_UNTIL.read().get(&target).map(|until| now < *until).unwrap_or(false)
+            || direct_bad_active(&target)
     };
     let is_any_cf_fallback =
         CFPROXY_ENABLED.load(Ordering::Relaxed) || !CF_WORKER_DOMAINS.read().is_empty();
+    // Медиа этого DC в текущем типе сети недавно «душили» на прямом WS.
+    let breaker_left = if is_media && !is_test_dc {
+        breaker_blocked_for(dc_key)
+    } else {
+        0.0
+    };
 
     // Fallback если DC нет в конфиге, WS в чёрном списке или IP на cooldown —
     // порт ветки из _handle_client оригинала.
     let mut pooled_ws: Option<RawWebSocket> = None;
     let mut use_pooled_direct = false;
-    if !dc_configured || blacklisted || (ip_cooldown_active && is_any_cf_fallback) {
+    if !dc_configured
+        || blacklisted
+        || breaker_left > 0.0
+        || (ip_cooldown_active && is_any_cf_fallback)
+    {
         if !dc_configured {
             linfo!("[{}] DC{} not in config -> fallback", label, dc);
         } else if blacklisted {
             linfo!("[{}] DC{}{} WS blacklisted -> fallback", label, dc, m_tag);
+        } else if breaker_left > 0.0 {
+            linfo!(
+                "[{}] DC{}{} медиа душили на прямом WS ({}) -> fallback ещё {:.0}s",
+                label, dc, m_tag,
+                net_kind_name(NET_KIND.load(Ordering::Relaxed)),
+                breaker_left
+            );
         } else {
             // Шанс пулу при случайном таймауте: пробуем забрать готовый WS.
             if !is_test_dc {
@@ -1959,7 +2182,7 @@ async fn serve_core<R, W>(
 
     // Пул уже выяснил, что работает только fronting — не тратим ws_timeout на
     // заведомо режущийся прямой SNI.
-    if ws_opt.is_none() && !is_test_dc && ws_pool_fronting_first() {
+    if ws_opt.is_none() && !is_test_dc && ws_pool_fronting_first() && !fronting_bad_active() {
         if let Some(d) = domains.first() {
             ws_opt = connect_fronted(&target, d, ws_path).await;
             if ws_opt.is_some() {
@@ -2041,7 +2264,16 @@ async fn serve_core<R, W>(
 
     // WS failed -> fallback (порт оригинала 1-в-1).
     if ws_opt.is_none() {
-        if ws_timed_out && !target.is_empty() {
+        // Сеть пропала или сменилась, пока шла попытка: провал говорит о сети,
+        // а не о маршруте — в блокировки не пишем.
+        let counts = failure_counts(epoch);
+        if !counts {
+            linfo!(
+                "[{}] DC{}{} WS не удался, но сеть сменилась/пропала — не учитываю",
+                label, dc, m_tag
+            );
+        }
+        if counts && ws_timed_out && !target.is_empty() {
             let strikes = {
                 let mut m = IP_TIMEOUT_STRIKES.write();
                 let e = m.entry(target.clone()).or_insert((0, 0.0));
@@ -2052,23 +2284,30 @@ async fn serve_core<R, W>(
                 e.1 = now;
                 e.0
             };
-            if strikes >= IP_FAIL_STRIKES {
+            // На LTE — с первого таймаута и на 5 минут (как в 1.3.1), на Wi-Fi —
+            // после 2 подряд и на 2 минуты. Плюс память по типу сети.
+            let (need_strikes, cooldown, remember) = ip_fail_policy();
+            if strikes >= need_strikes {
                 IP_FAIL_UNTIL
                     .write()
-                    .insert(target.clone(), now + IP_FAIL_COOLDOWN);
+                    .insert(target.clone(), now + cooldown);
+                direct_bad_mark(&target, now + remember);
                 linfo!(
-                    "[{}] DC{}{} WS connect to {} timed out ({}x), cooldown for {}s",
-                    label, dc, m_tag, target, strikes, IP_FAIL_COOLDOWN as i64
+                    "[{}] DC{}{} WS connect to {} timed out ({}x), cooldown for {}s ({})",
+                    label, dc, m_tag, target, strikes, cooldown as i64,
+                    net_kind_name(NET_KIND.load(Ordering::Relaxed))
                 );
             } else {
                 linfo!(
                     "[{}] DC{}{} WS connect to {} timed out ({}/{}), no cooldown yet",
-                    label, dc, m_tag, target, strikes, IP_FAIL_STRIKES
+                    label, dc, m_tag, target, strikes, need_strikes
                 );
             }
         }
 
-        if ws_failed_redirect && all_redirects {
+        if !counts {
+            // ничего не записываем
+        } else if ws_failed_redirect && all_redirects {
             WS_BLACKLIST.write().insert(dc_key, now + WS_BLACKLIST_TTL);
             lwarn!("[{}] DC{}{} blacklisted for WS (all 302)", label, dc, m_tag);
         } else if ws_failed_redirect {
@@ -2112,6 +2351,9 @@ async fn serve_core<R, W>(
     if !target.is_empty() {
         IP_FAIL_UNTIL.write().remove(&target);
         IP_TIMEOUT_STRIKES.write().remove(&target);
+        if failure_counts(epoch) && direct_bad_clear(&target) {
+            linfo!("[{}] прямой WS к {} снова работает ({})", label, target, net_kind_name(NET_KIND.load(Ordering::Relaxed)));
+        }
     }
     pools.ws.report_success(dc, is_media).await;
     STATS.connections_ws.fetch_add(1, Ordering::Relaxed);
@@ -2133,14 +2375,16 @@ async fn serve_core<R, W>(
         lwarn!(" direct relayInit write fail DC{}{}: closed", dc, m_tag);
         ws.close().await;
 
-        DC_FAIL_UNTIL.write().insert(dc_key, now + DC_FAIL_COOLDOWN);
+        if failure_counts(epoch) {
+            DC_FAIL_UNTIL.write().insert(dc_key, now + DC_FAIL_COOLDOWN);
+        }
 
         lwarn!(" direct retry fresh ws DC{}{}", dc, m_tag);
         let (retry_ws, retry_failed_redirect, retry_all_redirects) =
             connect_direct_ws(&target, &domains, ws_timeout, ws_path).await;
         match retry_ws {
             None => {
-                if retry_failed_redirect && retry_all_redirects {
+                if retry_failed_redirect && retry_all_redirects && failure_counts(epoch) {
                     WS_BLACKLIST.write().insert(dc_key, now_monotonic() + WS_BLACKLIST_TTL);
                     lwarn!(" DC{}{} заблокирован (302)", dc, m_tag);
                 }
@@ -2211,7 +2455,7 @@ async fn serve_core<R, W>(
         tg_encryptor,
         tg_decryptor,
         cancel_token,
-        true,
+        if is_media && !is_test_dc { Some(dc_key) } else { None },
     )
     .await;
 }
@@ -2246,6 +2490,8 @@ async fn connect_direct_hedged(
     // прямом пути и переключал на него все следующие соединения — хуже.
     match direct.await {
         Ok(ws) => DirectOutcome::Direct(ws),
+        // Fronting на этом типе сети недавно не прошёл — не тратим на него 7s.
+        Err(WsError::Timeout) if fronting_bad_active() => DirectOutcome::Failed(WsError::Timeout),
         Err(WsError::Timeout) => match connect_fronted(target, domain, ws_path).await {
             Some(ws) => DirectOutcome::Fronted(ws),
             None => DirectOutcome::Failed(WsError::Timeout),

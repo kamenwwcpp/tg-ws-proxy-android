@@ -195,6 +195,9 @@ pub extern "C" fn StopProxy() -> c_int {
     });
 
     STATS.reset();
+    // Не оставляем «сети нет» от прошлой сессии: Android пришлёт актуальное
+    // состояние при следующем старте.
+    NET_AVAILABLE.store(true, Ordering::SeqCst);
     clear_failure_state();
     proxy::reset_tcp_backoff();
     cfproxy::clear_cfproxy_429_cooldowns();
@@ -218,6 +221,30 @@ pub extern "C" fn NetworkChanged() -> c_int {
     runtime().spawn(async move {
         pools.reset().await;
     });
+    0
+}
+
+/// Состояние сети от Android: есть ли сеть по умолчанию и её тип
+/// (1 Wi-Fi, 2 мобильная, 3 Ethernet, 4 VPN/другая). Смена — новая «эпоха»:
+/// провалы попыток, начатых до неё, не записываются в блокировки.
+#[unsafe(no_mangle)]
+pub extern "C" fn SetNetworkState(available: c_int, kind: c_int) -> c_int {
+    let avail = available != 0;
+    let prev_avail = NET_AVAILABLE.swap(avail, Ordering::SeqCst);
+    // Пока сети нет, тип не трогаем: предохранитель хранится по типу сети.
+    let prev_kind = if avail {
+        NET_KIND.swap(kind, Ordering::SeqCst)
+    } else {
+        NET_KIND.load(Ordering::SeqCst)
+    };
+    if prev_avail != avail || (avail && prev_kind != kind) {
+        NET_EPOCH.fetch_add(1, Ordering::SeqCst);
+        if avail {
+            linfo!("Сеть: есть ({})", net_kind_name(kind));
+        } else {
+            linfo!("Сеть: нет — новые подключения не пытаемся, провалы не учитываем");
+        }
+    }
     0
 }
 

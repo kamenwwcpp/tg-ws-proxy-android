@@ -12,6 +12,7 @@ interface ProxyLibrary : Library {
     fun StartProxy(host: String, port: Int, dcIps: String, secret: String, verbose: Int): Int
     fun StopProxy(): Int
     fun NetworkChanged(): Int
+    fun SetNetworkState(available: Int, kind: Int): Int
     fun SetPoolSize(size: Int)
     fun SetBufferSizeKb(kb: Int)
     fun SetCfProxyCacheDir(cacheDir: String)
@@ -37,6 +38,10 @@ object NativeProxy {
 
     fun networkChanged(): Int {
         return ProxyLibrary.INSTANCE.NetworkChanged()
+    }
+
+    fun setNetworkState(available: Boolean, kind: Int): Int {
+        return ProxyLibrary.INSTANCE.SetNetworkState(if (available) 1 else 0, kind)
     }
 
     fun setPoolSize(size: Int) {

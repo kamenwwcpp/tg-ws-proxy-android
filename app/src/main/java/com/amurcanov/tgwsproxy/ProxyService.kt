@@ -12,6 +12,7 @@ import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -80,6 +81,7 @@ class ProxyService : Service() {
         private const val STATS_UPDATE_MS = 5_000L
         private const val NOTIFICATION_MIN_UPDATE_MS = 5_000L
         private const val NATIVE_STOP_WAIT_MS = 3_000L
+        private const val NET_KIND_UNKNOWN = 0
 
         // Нативное состояние процессное и не потокобезопасно между Start/Stop:
         // параллельные вызовы давали -1 на втором StartProxy (и авто-стоп рабочего
@@ -327,12 +329,22 @@ class ProxyService : Service() {
                 // Сеть пропала (нет сигнала, туннель). Если вернётся та же самая,
                 // onAvailable всё равно должен сбросить состояние: сокеты и NAT
                 // за время пропадания почти наверняка умерли.
-                if (network == current) current = null
+                // «Сети нет» — только если пропала именно текущая: при смене
+                // Wi-Fi -> LTE onLost(Wi-Fi) может прийти уже после onAvailable(LTE).
+                if (network == current) {
+                    current = null
+                    pushNetworkState(false, NET_KIND_UNKNOWN)
+                }
+            }
+
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                if (network == current) pushNetworkState(true, netKind(caps))
             }
 
             override fun onAvailable(network: Network) {
                 val prev = current
                 current = network
+                pushNetworkState(true, netKind(cm.getNetworkCapabilities(network)))
                 // Первый onAvailable прилетает сразу при регистрации — это не смена.
                 val first = !seenFirst
                 seenFirst = true
@@ -352,6 +364,29 @@ class ProxyService : Service() {
             networkCallback = callback
         } catch (e: Exception) {
             Log.w(TAG, "registerDefaultNetworkCallback failed", e)
+        }
+    }
+
+    // Тип сети для ядра: по нему ядро помнит, где медиа «душили». Под VPN
+    // (Happ и т.п.) Android добавляет к VPN-сети транспорты нижележащей сети,
+    // поэтому Wi-Fi/LTE проверяем раньше VPN.
+    private fun netKind(caps: NetworkCapabilities?): Int {
+        if (caps == null) return NET_KIND_UNKNOWN
+        return when {
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> 1
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> 2
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> 3
+            else -> 4
+        }
+    }
+
+    private fun pushNetworkState(available: Boolean, kind: Int) {
+        nativeScope.launch {
+            try {
+                NativeProxy.setNetworkState(available, kind)
+            } catch (e: Throwable) {
+                Log.w(TAG, "SetNetworkState failed", e)
+            }
         }
     }
 

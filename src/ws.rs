@@ -1000,8 +1000,12 @@ pub async fn connect_fronted(ip: &str, domain: &str, path: &str) -> Option<RawWe
         Ok(ws) => {
             STATS.connections_fronting.fetch_add(1, Ordering::Relaxed);
             crate::proxy::set_ws_pool_fronting_first(true);
+            fronting_mark(true);
             Some(ws)
         }
-        Err(_) => None,
+        Err(_) => {
+            fronting_mark(false);
+            None
+        }
     }
 }
