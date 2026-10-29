@@ -45,6 +45,29 @@ fn runtime() -> &'static Runtime {
     })
 }
 
+/// С panic = "unwind" паника гасит только свою задачу tokio, но её нужно видеть
+/// в логах приложения (идея форка Alexingin).
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}", l.file(), l.line()))
+                .unwrap_or_else(|| "?".to_string());
+            let payload = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic".to_string());
+            lerror!("PANIC {} at {}", payload, location);
+            prev(info);
+        }));
+    });
+}
+
 fn cstr_to_string(p: *const c_char) -> String {
     if p.is_null() {
         return String::new();
@@ -80,6 +103,7 @@ pub unsafe extern "C" fn StartProxy(
     let is_verbose = verbose != 0;
 
     init_logging(is_verbose);
+    install_panic_hook();
     cfproxy::clear_cfproxy_429_cooldowns();
 
     if secret_str.len() == 32 {
@@ -190,9 +214,7 @@ pub extern "C" fn NetworkChanged() -> c_int {
         None => return -1,
     };
     linfo!("Network changed: resetting pools and failure state");
-    clear_failure_state();
-    proxy::reset_tcp_backoff();
-    cfproxy::clear_cfproxy_429_cooldowns();
+    proxy::reset_route_state();
     runtime().spawn(async move {
         pools.reset().await;
     });

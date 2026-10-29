@@ -42,5 +42,6 @@ log = "0.4"
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
+# panic = "unwind" (по умолчанию): паника в задаче одного соединения гасит
+# только эту задачу tokio, а не всё приложение вместе с прокси (было "abort").
 strip = true

@@ -23,6 +23,9 @@ pub const IP_FAIL_STRIKES: u32 = 2;
 // Окно, в котором таймауты считаются «подряд».
 pub const IP_FAIL_STRIKE_WINDOW: f64 = 120.0;
 pub const DC_FAIL_COOLDOWN: f64 = 60.0;
+// «Все домены ответили 302» — DC в fallback на 10 минут, а не навсегда
+// (так у форка Alexingin; в актуальном Flowseal чёрного списка нет вовсе).
+pub const WS_BLACKLIST_TTL: f64 = 600.0;
 // Апстрим 2s: TCP+TLS+HTTP upgrade на мобильном RTT 300-700ms не влезает,
 // и один сбой цепочкой порождал следующие.
 pub const WS_FAIL_TIMEOUT: f64 = 4.0;
@@ -243,7 +246,9 @@ impl DcKey {
 
 // Global state — proxy/tg_ws_proxy.py: ws_blacklist / dc_fail_until / ip_fail_until
 pub static DC_OPT: Lazy<RwLock<HashMap<i32, String>>> = Lazy::new(|| RwLock::new(HashMap::new()));
-pub static WS_BLACKLIST: Lazy<RwLock<HashMap<DcKey, bool>>> =
+// Значение — момент (now_monotonic), до которого DC в чёрном списке. Раньше
+// список был бессрочным: один ответ 302 уводил DC в fallback до перезапуска.
+pub static WS_BLACKLIST: Lazy<RwLock<HashMap<DcKey, f64>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 pub static DC_FAIL_UNTIL: Lazy<RwLock<HashMap<DcKey, f64>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));

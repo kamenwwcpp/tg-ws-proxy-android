@@ -442,6 +442,11 @@ struct DohResponse {
 static DOH_CACHE: Lazy<parking_lot::RwLock<std::collections::HashMap<String, (String, Instant)>>> =
     Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
 
+/// После смены сети DNS-ответы могут отличаться — сбрасываем кэш (как у Alexingin).
+pub fn clear_doh_cache() {
+    DOH_CACHE.write().clear();
+}
+
 fn pick_preferred_ip(candidates: &[String]) -> String {
     let mut fallback_v6 = String::new();
     for c in candidates {

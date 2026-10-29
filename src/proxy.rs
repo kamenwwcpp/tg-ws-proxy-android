@@ -77,10 +77,10 @@ pub fn ws_domains(dc: i32, is_media: bool) -> Vec<String> {
             format!("kws{}.web.telegram.org", effective_dc),
         ]
     } else {
-        vec![
-            format!("kws{}.web.telegram.org", effective_dc),
-            format!("kws{}-1.web.telegram.org", effective_dc),
-        ]
+        // Как в актуальном Flowseal (utils.ws_domains, 50c980e) и форках
+        // crim50n/Alexingin: kwsN-1 — медиа-домен, обычным сессиям он не нужен
+        // и лишь удлинял перебор при сбоях.
+        vec![format!("kws{}.web.telegram.org", effective_dc)]
     }
 }
 
@@ -1177,6 +1177,49 @@ pub fn reset_tcp_backoff() {
     TCP_BACKOFF.lock().clear();
 }
 
+// ---------------------------------------------------------------------------
+// Самовосстановление (идея форка Alexingin): если несколько подключений подряд
+// не нашли ни одного рабочего маршрута, снимаем все накопленные блокировки и
+// сбрасываем пул — как при смене сети. Раньше в такой ситуации помогал только
+// ручной перезапуск прокси. Срабатывает не чаще раза в минуту.
+// ---------------------------------------------------------------------------
+
+static FAIL_STREAK: AtomicI32 = AtomicI32::new(0);
+static LAST_AUTO_RESET: parking_lot::Mutex<f64> = parking_lot::Mutex::new(f64::NEG_INFINITY);
+const AUTO_RESET_FAIL_STREAK: i32 = 4;
+const AUTO_RESET_MIN_INTERVAL: f64 = 60.0;
+
+fn note_connection_success() {
+    FAIL_STREAK.store(0, Ordering::Relaxed);
+}
+
+async fn note_connection_failure(pools: &ProxyPools) {
+    let streak = FAIL_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+    if streak < AUTO_RESET_FAIL_STREAK {
+        return;
+    }
+    {
+        let now = now_monotonic();
+        let mut last = LAST_AUTO_RESET.lock();
+        if now - *last < AUTO_RESET_MIN_INTERVAL {
+            return;
+        }
+        *last = now;
+    }
+    FAIL_STREAK.store(0, Ordering::Relaxed);
+    lwarn!("{} подключений подряд без маршрута -> сброс блокировок и пула", streak);
+    reset_route_state();
+    pools.reset().await;
+}
+
+/// Снять все cooldown'ы/блокировки маршрутов (смена сети, самовосстановление).
+pub fn reset_route_state() {
+    clear_failure_state();
+    reset_tcp_backoff();
+    clear_cfproxy_429_cooldowns();
+    clear_doh_cache();
+}
+
 fn tcp_backoff_active(key: &str) -> bool {
     TCP_BACKOFF
         .lock()
@@ -1422,6 +1465,7 @@ where
             tcp_connect_fallback(&fallback_dst, secure_port, relay_init, &label).await
         {
             STATS.connections_tcp_fallback.fetch_add(1, Ordering::Relaxed);
+            note_connection_success();
             bridge_tcp(
                 conn_read,
                 conn_write,
@@ -1486,6 +1530,7 @@ where
         };
         if let Some(ws) = worker_ws {
             STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
+            note_connection_success();
             if ws.send(relay_init).await.is_ok() {
                 bridge_ws(
                     conn_read,
@@ -1517,6 +1562,7 @@ where
             cfproxy_acquire_ws(dc, is_media, ws_path, &cancel_token).await
         {
             STATS.connections_cfproxy.fetch_add(1, Ordering::Relaxed);
+            note_connection_success();
             linfo!(" DC{}{} подключен через CF", dc, m_tag);
 
             if ws.send(relay_init).await.is_ok() {
@@ -1819,7 +1865,7 @@ async fn serve_core<R, W>(
     let dc_configured = target_opt.is_some();
     let target = target_opt.unwrap_or_default();
 
-    let blacklisted = WS_BLACKLIST.read().get(&dc_key).copied().unwrap_or(false);
+    let blacklisted = WS_BLACKLIST.read().get(&dc_key).map(|until| now < *until).unwrap_or(false);
     let ip_cooldown_active = if target.is_empty() {
         false
     } else {
@@ -1881,6 +1927,7 @@ async fn serve_core<R, W>(
             .await;
             if !ok {
                 lwarn!("[{}] DC{}{} no fallback available", label, dc, m_tag);
+                note_connection_failure(pools).await;
             }
             return;
         }
@@ -2022,7 +2069,7 @@ async fn serve_core<R, W>(
         }
 
         if ws_failed_redirect && all_redirects {
-            WS_BLACKLIST.write().insert(dc_key, true);
+            WS_BLACKLIST.write().insert(dc_key, now + WS_BLACKLIST_TTL);
             lwarn!("[{}] DC{}{} blacklisted for WS (all 302)", label, dc, m_tag);
         } else if ws_failed_redirect {
             DC_FAIL_UNTIL.write().insert(dc_key, now + DC_FAIL_COOLDOWN);
@@ -2054,10 +2101,14 @@ async fn serve_core<R, W>(
         .await;
         if ok {
             linfo!("[{}] DC{}{} fallback closed", label, dc, m_tag);
+        } else {
+            lwarn!("[{}] DC{}{} no fallback available", label, dc, m_tag);
+            note_connection_failure(pools).await;
         }
         return;
     }
 
+    note_connection_success();
     if !target.is_empty() {
         IP_FAIL_UNTIL.write().remove(&target);
         IP_TIMEOUT_STRIKES.write().remove(&target);
@@ -2090,7 +2141,7 @@ async fn serve_core<R, W>(
         match retry_ws {
             None => {
                 if retry_failed_redirect && retry_all_redirects {
-                    WS_BLACKLIST.write().insert(dc_key, true);
+                    WS_BLACKLIST.write().insert(dc_key, now_monotonic() + WS_BLACKLIST_TTL);
                     lwarn!(" DC{}{} заблокирован (302)", dc, m_tag);
                 }
                 lwarn!(" direct fallback DC{}{}", dc, m_tag);
@@ -2309,6 +2360,12 @@ pub async fn run_proxy(
         }
     });
 
+    // Ошибки accept() раньше просто пропускались через `continue`: при сломанном
+    // слушающем сокете цикл крутился вхолостую, а TG не мог подключиться до
+    // ручного перезапуска. Теперь пауза, а после серии ошибок — пересоздание
+    // сокета (как у форка Alexingin; аналог listener watchdog в Flowseal).
+    let mut listener = listener;
+    let mut accept_errors: u32 = 0;
     loop {
         tokio::select! {
             _ = cancel_root.cancelled() => {
@@ -2317,14 +2374,47 @@ pub async fn run_proxy(
             accept = listener.accept() => {
                 match accept {
                     Ok((conn, _)) => {
+                        accept_errors = 0;
                         let p = pools.clone();
                         let cancel = cancel_root.child_token();
                         tokio::spawn(async move {
                             handle_client(p, conn, cancel).await;
                         });
                     }
-                    Err(_) => {
-                        continue;
+                    Err(e) => {
+                        accept_errors += 1;
+                        if accept_errors == 1 || accept_errors % 20 == 0 {
+                            lwarn!("accept error #{}: {}", accept_errors, e);
+                        }
+                        tokio::select! {
+                            _ = cancel_root.cancelled() => break,
+                            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                        }
+                        if accept_errors >= 10 {
+                            let addr = format!("{}:{}", host, port);
+                            drop(listener);
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            loop {
+                                match TcpListener::bind(&addr).await {
+                                    Ok(l) => {
+                                        lwarn!("Listening socket restored on {}", addr);
+                                        listener = l;
+                                        accept_errors = 0;
+                                        break;
+                                    }
+                                    Err(be) => {
+                                        lwarn!("Re-bind {} failed: {}, retry in 2s", addr, be);
+                                        tokio::select! {
+                                            _ = cancel_root.cancelled() => {
+                                                pools.close_all().await;
+                                                return Ok(());
+                                            }
+                                            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
