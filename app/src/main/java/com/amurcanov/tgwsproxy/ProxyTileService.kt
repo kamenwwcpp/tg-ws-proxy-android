@@ -30,6 +30,10 @@ class ProxyTileService : TileService() {
             }
         }
         renderTile()
+        // Открыли шторку: если прокси должен работать, но выгружен — поднимаем.
+        if (!ProxyService.isRunning.value && KeepAlive.isDesired(this)) {
+            scope.launch { KeepAlive.reviveIfNeeded(this@ProxyTileService, "шторка") }
+        }
     }
 
     override fun onStopListening() {

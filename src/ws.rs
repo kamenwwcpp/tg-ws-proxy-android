@@ -88,7 +88,14 @@ use once_cell::sync::Lazy;
 
 // Глобальный TLS-конфиг с session resumption cache (аналог tls.NewLRUClientSessionCache(100))
 static TLS_CONFIG: Lazy<Arc<ClientConfig>> = Lazy::new(|| {
-    let mut cfg = ClientConfig::builder()
+    // Только X25519, как в Flowseal 1.11.3 (a70fc8c): лишние группы раздувают
+    // ClientHello, а крупный ClientHello провоцирует DPI (TimeoutError).
+    // Постквантового X25519MLKEM768 в провайдере ring и так нет.
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider.kx_groups = vec![rustls::crypto::ring::kx_group::X25519];
+    let mut cfg = ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .expect("ring provider supports default TLS versions")
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerify))
         .with_no_client_auth();
@@ -391,14 +398,17 @@ impl RawWebSocket {
     }
 
     pub async fn close(&self) {
-        if self.closed.swap(true, Ordering::Relaxed) {
-            return;
+        // Flowseal #1517: если WS уже помечен закрытым (ошибка чтения, OP_CLOSE от
+        // сервера), транспорт всё равно нужно закрыть — раньше тут был ранний
+        // return, и сокет висел, пока не освободится память. Close-фрейм — только
+        // при первом закрытии.
+        if !self.closed.swap(true, Ordering::Relaxed) {
+            let frame = build_frame(OP_CLOSE, &[], true);
+            let _ = self.write_frame(&frame, WS_CONTROL_TIMEOUT).await;
         }
-        // Best-effort close frame + shutdown транспорта.
-        let frame = build_frame(OP_CLOSE, &[], true);
-        let _ = self.write_frame(&frame, WS_CONTROL_TIMEOUT).await;
+        // Shutdown TLS на мёртвом сокете мог висеть без ограничения (Alexingin).
         let mut writer = self.writer.lock().await;
-        let _ = shutdown_match(&mut writer).await;
+        let _ = tokio::time::timeout(WS_CONTROL_TIMEOUT, shutdown_match(&mut writer)).await;
     }
 
     // recv с дедлайном чтения (для bridge).

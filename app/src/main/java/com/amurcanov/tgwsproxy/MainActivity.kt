@@ -70,6 +70,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import androidx.lifecycle.lifecycleScope
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.util.concurrent.atomic.AtomicLong
@@ -105,6 +106,17 @@ class MainActivity : ComponentActivity() {
         }
         
         androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
+
+        // Автоподъём: прокси должен работать, но прошивка его выгрузила.
+        // Плюс один раз после первого запуска просим разрешение на работу в фоне.
+        lifecycleScope.launch {
+            KeepAlive.reviveIfNeeded(this@MainActivity, "приложение открыто")
+            ProxyService.isRunning.collect { running ->
+                if (running && KeepAlive.shouldAskBatteryOnce(this@MainActivity)) {
+                    KeepAlive.openBatterySettings(this@MainActivity)
+                }
+            }
+        }
 
         setContent {
             val context = LocalContext.current

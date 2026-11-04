@@ -70,6 +70,9 @@ pub const BRIDGE_PING_INTERVAL: Duration = Duration::from_secs(120);
 pub const CFPROXY_ACQUIRE_DEADLINE: Duration = Duration::from_secs(20);
 pub const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const WS_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+// Flowseal #1517: сколько дочитывать у клиента с неверным секретом.
+pub const BAD_HANDSHAKE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+pub const BAD_HANDSHAKE_DRAIN_LIMIT: usize = 64 * 1024;
 pub const WS_BRIDGE_CHUNK_SIZE: usize = 64 * 1024;
 pub const POOLED_FRAME_CAP: usize = WS_BRIDGE_CHUNK_SIZE + 32;
 

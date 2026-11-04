@@ -1955,17 +1955,38 @@ async fn serve_core<R, W>(
         static BAD_LAST: parking_lot::Mutex<f64> = parking_lot::Mutex::new(f64::NEG_INFINITY);
         let suppressed = BAD_LOGGED.fetch_add(1, Ordering::Relaxed);
         let now_t = now_monotonic();
-        let mut last = BAD_LAST.lock();
-        if now_t - *last >= 10.0 {
-            *last = now_t;
+        let should_log = {
+            let mut last = BAD_LAST.lock();
+            if now_t - *last >= 10.0 {
+                *last = now_t;
+                true
+            } else {
+                false
+            }
+        };
+        if should_log {
             BAD_LOGGED.store(0, Ordering::Relaxed);
-            drop(last);
             lwarn!(
                 "[{}] bad handshake (wrong secret or proto){} — в Telegram, вероятно, старая запись прокси со старым секретом",
                 label,
                 if suppressed > 0 { format!(", ещё {} за 10s", suppressed) } else { String::new() }
             );
         }
+        // Flowseal #1517: не рвём соединение сразу, а молча дочитываем до 64 КБ
+        // или 10s. Иначе клиент со старым секретом мгновенно переподключается
+        // по кругу (видели ~250 подключений в секунду).
+        let _ = tokio::time::timeout(BAD_HANDSHAKE_DRAIN_TIMEOUT, async {
+            let mut buf = [0u8; 4096];
+            let mut remaining = BAD_HANDSHAKE_DRAIN_LIMIT;
+            while remaining > 0 {
+                let n = match conn_read.read(&mut buf[..remaining.min(4096)]).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                remaining -= n;
+            }
+        })
+        .await;
         return;
     }
 

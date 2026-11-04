@@ -72,6 +72,7 @@ class ProxyService : Service() {
         const val EXTRA_CFPROXY_PRIORITY = "EXTRA_CFPROXY_PRIORITY"
         const val EXTRA_CFPROXY_DOMAIN = "EXTRA_CFPROXY_DOMAIN"
         const val EXTRA_SECRET_KEY = "EXTRA_SECRET_KEY"
+        const val EXTRA_AUTO_REVIVE = "EXTRA_AUTO_REVIVE"
 
         private const val NOTIFICATION_ID = 101
         private const val CHANNEL_ID = "TG_WS_Proxy_Service_v4"
@@ -116,7 +117,12 @@ class ProxyService : Service() {
                     stopSelf()
                     return START_NOT_STICKY
                 }
-                LogManager.clearLogs()
+                // Автоподъём: логи не чистим — в них видно, почему прокси останавливался.
+                if (intent.getStringExtra(EXTRA_AUTO_REVIVE) == null) {
+                    LogManager.clearLogs()
+                } else {
+                    Log.w("TgWsProxy", "[WARN] Автоподъём: прокси запущен заново (${intent.getStringExtra(EXTRA_AUTO_REVIVE)})")
+                }
                 startProxy(
                     ProxyConfig(
                         bindIp = intent.getStringExtra(EXTRA_BIND_IP) ?: "127.0.0.1",
@@ -131,6 +137,8 @@ class ProxyService : Service() {
                 )
             }
             ACTION_STOP -> {
+                // Выключение пользователем (кнопка, плитка, уведомление): не поднимать.
+                KeepAlive.onUserStopped(this)
                 stopProxy()
             }
             ACTION_RESTART -> {
@@ -229,6 +237,7 @@ class ProxyService : Service() {
             when {
                 code == 0 -> {
                     updateRunningState(true)
+                    KeepAlive.onProxyStarted(this@ProxyService)
                     _isVerifiedRunning.value = true
                     updateNotification(getString(R.string.notification_running), force = true)
                     Log.i(TAG, "Proxy ready: listening on port ${cfg.port}")
