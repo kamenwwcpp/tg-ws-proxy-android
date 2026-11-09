@@ -808,68 +808,6 @@ pub fn is_http_transport(data: &[u8]) -> bool {
 // Сессионная статистика как в bridge_ws_reencrypt оригинала.
 // ---------------------------------------------------------------------------
 
-/// Окно «запрос без ответа» для детектора зависания медиа.
-#[derive(Default)]
-struct StallWindow {
-    pending_since: Option<std::time::Instant>,
-    up: i64,
-    down: i64,
-    last_down: Option<std::time::Instant>,
-}
-
-impl StallWindow {
-    fn reset(&mut self) {
-        self.pending_since = None;
-        self.up = 0;
-        self.down = 0;
-    }
-
-    fn on_request(&mut self, n: i64) {
-        let now = std::time::Instant::now();
-        // TG уже получил что-то после открытия окна — это новый запрос.
-        let answered = match (self.pending_since, self.last_down) {
-            (Some(since), Some(last)) => last >= since,
-            _ => false,
-        };
-        if self.pending_since.is_none() || answered {
-            self.pending_since = Some(now);
-            self.up = 0;
-            self.down = 0;
-        }
-        self.up += n;
-    }
-
-    /// true — пришёл осмысленный ответ, прямой WS отвечает.
-    fn on_response(&mut self, n: i64) -> bool {
-        self.last_down = Some(std::time::Instant::now());
-        if self.pending_since.is_some() {
-            self.down += n;
-            if self.down >= STALL_MIN_MEANINGFUL_DOWN {
-                self.reset();
-                return true;
-            }
-        }
-        false
-    }
-
-    fn is_stalled(&self) -> Option<(i64, i64)> {
-        let since = self.pending_since?;
-        if since.elapsed() < STALL_TIMEOUT
-            || self.up < STALL_MIN_PENDING_UP
-            || self.down >= STALL_MIN_MEANINGFUL_DOWN
-        {
-            return None;
-        }
-        // Вниз должно молчать столько же: медленный, но идущий поток — не зависание.
-        if let Some(last) = self.last_down {
-            if last.elapsed() < STALL_TIMEOUT {
-                return None;
-            }
-        }
-        Some((self.up, self.down))
-    }
-}
-
 pub async fn bridge_ws<R, W>(
     conn_read: R,
     conn_write: W,
@@ -883,7 +821,6 @@ pub async fn bridge_ws<R, W>(
     mut tg_enc: TrackedStream,
     mut tg_dec: TrackedStream,
     cancel_token: CancellationToken,
-    stall_key: Option<DcKey>,
 ) where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send + 'static,
@@ -899,58 +836,6 @@ pub async fn bridge_ws<R, W>(
     let mut conn_write = conn_write;
 
     let last_activity = Arc::new(Mutex::new(std::time::Instant::now()));
-
-    // Детектор зависания медиа (только медиа по прямому WS, stall_key = Some).
-    // Окно «запрос без ответа»: открывается на данных от TG, закрывается, когда
-    // пришло >= STALL_MIN_MEANINGFUL_DOWN. Если TG что-то получил после открытия
-    // окна, новый запрос открывает окно заново (иначе мелкий ответ + долгая
-    // пауза давали бы ложное зависание). Зависание: окно старше STALL_TIMEOUT,
-    // запросов >= STALL_MIN_PENDING_UP, ответа < порога и вниз тишина.
-    // Instant и таймеры tokio идут только пока CPU не спит — сон не даёт
-    // ложных срабатываний.
-    let stall = stall_key.map(|_| Arc::new(parking_lot::Mutex::new(StallWindow::default())));
-    let close_reason_stall = Arc::new(Mutex::new(String::new()));
-    let stall_task = match (stall_key, stall.clone()) {
-        (Some(key), Some(stall_w)) => {
-            let cancel_st = cancel.clone();
-            let cancel_token_st = cancel_token.clone();
-            let reason = close_reason_stall.clone();
-            let label_st = label.clone();
-            let epoch_start = net_epoch();
-            Some(tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(1));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tokio::select! {
-                        _ = cancel_token_st.cancelled() => return,
-                        _ = cancel_st.cancelled() => return,
-                        _ = interval.tick() => {}
-                    }
-                    if !failure_counts(epoch_start) {
-                        // Сети нет или она сменилась — это не «душат медиа».
-                        stall_w.lock().reset();
-                        continue;
-                    }
-                    let stalled = {
-                        let w = stall_w.lock();
-                        w.is_stalled()
-                    };
-                    let Some((up, down)) = stalled else { continue };
-                    let (strikes, block) = breaker_record_stall(key);
-                    let msg = format!(
-                        "медиа зависло: ^{}B без ответа (v{}B) {}s; прямой WS в обход на {:.0}s ({}, зависание #{})",
-                        up, down, STALL_TIMEOUT.as_secs(), block,
-                        net_kind_name(NET_KIND.load(Ordering::Relaxed)), strikes
-                    );
-                    lwarn!("[{}] {}", label_st, msg);
-                    *reason.lock().await = "upstream: media stall".to_string();
-                    cancel_st.cancel();
-                    return;
-                }
-            }))
-        }
-        _ => None,
-    };
 
     // Keepalive ровно как в 1.3.1: ping только после BRIDGE_PING_INTERVAL
     // тишины в обе стороны, ответ не проверяем. В 1.3.2 пинги каждые 45s и
@@ -984,7 +869,6 @@ pub async fn bridge_ws<R, W>(
     // up: client -> ws
     let ws_up = ws.clone();
     let la_up = last_activity.clone();
-    let stall_up = stall.clone();
     let cancel_up = cancel.clone();
     let cancel_token_up = cancel_token.clone();
     let up_bytes = Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -1038,9 +922,6 @@ pub async fn bridge_ws<R, W>(
             up_bytes_c.fetch_add(n as i64, Ordering::Relaxed);
             up_packets_c.fetch_add(1, Ordering::Relaxed);
             *la_up.lock().await = std::time::Instant::now();
-            if let Some(w) = &stall_up {
-                w.lock().on_request(n as i64);
-            }
 
             clt_dec.xor(chunk);
             tg_enc.xor(chunk);
@@ -1070,7 +951,6 @@ pub async fn bridge_ws<R, W>(
     // down: ws -> client
     let ws_down = ws.clone();
     let la_down = last_activity.clone();
-    let stall_down = stall.clone();
     let cancel_down = cancel.clone();
     let cancel_token_down = cancel_token.clone();
     let down_bytes = Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -1107,14 +987,6 @@ pub async fn bridge_ws<R, W>(
             down_bytes_c.fetch_add(n as i64, Ordering::Relaxed);
             down_packets_c.fetch_add(1, Ordering::Relaxed);
             *la_down.lock().await = std::time::Instant::now();
-            if let Some(w) = &stall_down {
-                let responsive = w.lock().on_response(n as i64);
-                if responsive {
-                    if let Some(k) = stall_key {
-                        breaker_record_responsive(k);
-                    }
-                }
-            }
 
             tg_dec.xor(&mut data);
             clt_enc.xor(&mut data);
@@ -1131,17 +1003,11 @@ pub async fn bridge_ws<R, W>(
     let _ = down_task.await;
     cancel.cancel();
     ping_task.abort();
-    if let Some(t) = stall_task {
-        t.abort();
-    }
 
     let close_reason = {
         let up_r = close_reason_up.lock().await.clone();
         let down_r = close_reason_down.lock().await.clone();
-        let stall_r = close_reason_stall.lock().await.clone();
-        if !stall_r.is_empty() {
-            stall_r
-        } else if !down_r.is_empty() {
+        if !down_r.is_empty() {
             down_r
         } else if !up_r.is_empty() {
             up_r
@@ -1195,7 +1061,6 @@ pub async fn bridge_ws_stream(
         tg_enc,
         tg_dec,
         cancel_token,
-        None,
     )
     .await;
 }
@@ -1355,7 +1220,7 @@ async fn note_connection_failure(pools: &ProxyPools) {
     FAIL_STREAK.store(0, Ordering::Relaxed);
     lwarn!("{} подключений подряд без маршрута -> сброс блокировок и пула", streak);
     reset_route_state();
-    breaker_clear_all();
+    clear_route_memory();
     pools.reset().await;
 }
 
@@ -1723,7 +1588,6 @@ where
                     tg_enc.clone_state(),
                     tg_dec.clone_state(),
                     cancel_token,
-                    None,
                 )
                 .await;
                 return true;
@@ -1756,7 +1620,6 @@ where
                     tg_enc.clone_state(),
                     tg_dec.clone_state(),
                     cancel_token,
-                    None,
                 )
                 .await;
                 return true;
@@ -2100,33 +1963,18 @@ async fn serve_core<R, W>(
     };
     let is_any_cf_fallback =
         CFPROXY_ENABLED.load(Ordering::Relaxed) || !CF_WORKER_DOMAINS.read().is_empty();
-    // Медиа этого DC в текущем типе сети недавно «душили» на прямом WS.
-    let breaker_left = if is_media && !is_test_dc {
-        breaker_blocked_for(dc_key)
-    } else {
-        0.0
-    };
-
     // Fallback если DC нет в конфиге, WS в чёрном списке или IP на cooldown —
     // порт ветки из _handle_client оригинала.
     let mut pooled_ws: Option<RawWebSocket> = None;
     let mut use_pooled_direct = false;
     if !dc_configured
         || blacklisted
-        || breaker_left > 0.0
         || (ip_cooldown_active && is_any_cf_fallback)
     {
         if !dc_configured {
             linfo!("[{}] DC{} not in config -> fallback", label, dc);
         } else if blacklisted {
             linfo!("[{}] DC{}{} WS blacklisted -> fallback", label, dc, m_tag);
-        } else if breaker_left > 0.0 {
-            linfo!(
-                "[{}] DC{}{} медиа душили на прямом WS ({}) -> fallback ещё {:.0}s",
-                label, dc, m_tag,
-                net_kind_name(NET_KIND.load(Ordering::Relaxed)),
-                breaker_left
-            );
         } else {
             // Шанс пулу при случайном таймауте: пробуем забрать готовый WS.
             if !is_test_dc {
@@ -2476,7 +2324,6 @@ async fn serve_core<R, W>(
         tg_encryptor,
         tg_decryptor,
         cancel_token,
-        if is_media && !is_test_dc { Some(dc_key) } else { None },
     )
     .await;
 }
