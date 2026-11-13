@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -18,7 +19,7 @@ import (
 
 func main() {
 	listenFlag := flag.String("listen", "127.0.0.1:1443", "Address to listen on (e.g. 127.0.0.1:1443)")
-	secretFlag := flag.String("secret", "eed41d8cd98f00b204e9800998ecf8427e676f6f676c652e636f6d", "Proxy secret (plain hex or ee<secret><domain>)")
+	secretFlag := flag.String("secret", "", "Proxy secret (plain hex or ee<secret><domain>)")
 	domainFlag := flag.String("domain", "google.com", "Masking domain for Fake TLS")
 	cfWorkerFlag := flag.String("cf-worker", "", "Comma-separated Cloudflare worker domains for fallback")
 	cfDomainsFlag := flag.String("cf-domains", "", "Comma-separated Cloudflare proxy base domains")
@@ -26,7 +27,18 @@ func main() {
 	statsIntervalFlag := flag.Int("stats-interval", 15, "Seconds between stats logs (0 to disable)")
 
 	noCFFlag := flag.Bool("no-cf", false, "Disable Cloudflare fallback")
+	secretStdin := flag.Bool("secret-stdin", false, "Read secret from standard input")
 	flag.Parse()
+	if *secretStdin {
+		secret, err := io.ReadAll(io.LimitReader(os.Stdin, 1025))
+		if err != nil || len(secret) > 1024 {
+			log.Fatal("Could not read proxy secret")
+		}
+		*secretFlag = strings.TrimSpace(string(secret))
+	}
+	if *secretFlag == "" {
+		log.Fatal("A proxy secret is required")
+	}
 
 	if *cfDomainsFlag != "" {
 		var list []string

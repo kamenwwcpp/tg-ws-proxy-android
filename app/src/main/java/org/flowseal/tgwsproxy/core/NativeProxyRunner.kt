@@ -55,10 +55,7 @@ class NativeProxyRunner(private val context: Context) {
             add(libFile.absolutePath)
             add("-listen")
             add("127.0.0.1:$port")
-            if (secret.isNotBlank()) {
-                add("-secret")
-                add(secret)
-            }
+            add("-secret-stdin")
             if (domain.isNotBlank()) {
                 add("-domain")
                 add(domain)
@@ -87,6 +84,7 @@ class NativeProxyRunner(private val context: Context) {
             pb.redirectErrorStream(true)
             val startedProcess = pb.start()
             process = startedProcess
+            startedProcess.outputStream.bufferedWriter(Charsets.UTF_8).use { it.write(secret) }
 
             Thread {
                 try {

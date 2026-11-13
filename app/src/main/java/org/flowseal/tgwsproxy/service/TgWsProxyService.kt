@@ -6,11 +6,9 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.net.wifi.WifiManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
-import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -38,8 +36,6 @@ data class ProxyStats(
 class TgWsProxyService : Service() {
 
     private lateinit var runner: NativeProxyRunner
-    private var wakeLock: PowerManager.WakeLock? = null
-    private var wifiLock: WifiManager.WifiLock? = null
 
     companion object {
         const val NOTIFICATION_ID = 1001
@@ -189,14 +185,11 @@ class TgWsProxyService : Service() {
         try {
             LogFormatter.reset()
             isStoppingExplicitly = false
-            acquireLocks()
 
             val notification = buildNotification(port)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                    type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                val type = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
                 startForeground(NOTIFICATION_ID, notification, type)
             } else {
                 startForeground(NOTIFICATION_ID, notification)
@@ -234,7 +227,6 @@ class TgWsProxyService : Service() {
     private fun stopProxy() {
         isStoppingExplicitly = true
         runner.stop()
-        releaseLocks()
         LogFormatter.reset()
         _isRunning.value = false
         _statsFlow.value = ProxyStats()
@@ -331,42 +323,6 @@ class TgWsProxyService : Service() {
             .addAction(R.drawable.ic_stop, getString(R.string.action_stop), stopPendingIntent)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
-    }
-
-    @Suppress("DEPRECATION")
-    private fun acquireLocks() {
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "TgWsProxy::ServiceWakeLock"
-        )
-        wakeLock?.apply {
-            setReferenceCounted(false)
-            acquire(12 * 60 * 60 * 1000L) // 12 hours max
-        }
-
-        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        wifiLock = wifiManager.createWifiLock(
-            WifiManager.WIFI_MODE_FULL_HIGH_PERF,
-            "TgWsProxy::ServiceWifiLock"
-        )
-        wifiLock?.apply {
-            setReferenceCounted(false)
-            acquire()
-        }
-    }
-
-    private fun releaseLocks() {
-        try {
-            if (wakeLock?.isHeld == true) wakeLock?.release()
-        } catch (e: RuntimeException) {
-            android.util.Log.w("TgWsProxyService", "WakeLock release error: ${e.message}")
-        }
-        try {
-            if (wifiLock?.isHeld == true) wifiLock?.release()
-        } catch (e: RuntimeException) {
-            android.util.Log.w("TgWsProxyService", "WifiLock release error: ${e.message}")
-        }
     }
 
     override fun onDestroy() {

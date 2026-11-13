@@ -10,7 +10,6 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -48,7 +47,6 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         checkPermissions()
-        requestBatteryOptimizationExemption()
         lifecycleScope.launch {
             try {
                 SettingsManager.migrateLegacySettings(this@MainActivity)
@@ -72,24 +70,6 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 .show()
-        }
-    }
-
-    private fun requestBatteryOptimizationExemption() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                try {
-                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                        data = Uri.parse("package:$packageName")
-                    }
-                    startActivity(intent)
-                } catch (e: ActivityNotFoundException) {
-                    android.util.Log.w("MainActivity", "Battery optimization intent not supported on this device", e)
-                } catch (e: SecurityException) {
-                    android.util.Log.w("MainActivity", "Battery optimization permission denied", e)
-                }
-            }
         }
     }
 
