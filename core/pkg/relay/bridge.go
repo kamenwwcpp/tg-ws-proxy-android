@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"tg-ws-proxy-core/pkg/crypto"
@@ -30,15 +31,21 @@ func BridgeWS(
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Keepalive ping ticker every two minutes
+	// Only send a keepalive after an idle interval.
+	const keepaliveInterval = 120 * time.Second
+	started := time.Now()
+	var lastActivity atomic.Int64
 	go func() {
-		ticker := time.NewTicker(120 * time.Second)
+		ticker := time.NewTicker(keepaliveInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				if time.Since(started)-time.Duration(lastActivity.Load()) < keepaliveInterval {
+					continue
+				}
 				if err := remoteWS.Ping(); err != nil {
 					cancel()
 					return
@@ -68,6 +75,7 @@ func BridgeWS(
 			n, err := client.Read(buf)
 			if n > 0 {
 				chunk := buf[:n]
+				lastActivity.Store(int64(time.Since(started)))
 				stats.AddBytesUp(n)
 
 				if splitter != nil {
@@ -127,6 +135,7 @@ func BridgeWS(
 			}
 
 			n := len(data)
+			lastActivity.Store(int64(time.Since(started)))
 			stats.AddBytesDown(n)
 
 			// In-place dual CTR stream decrypt and re-encrypt directly in data buffer

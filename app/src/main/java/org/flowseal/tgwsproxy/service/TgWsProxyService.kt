@@ -94,7 +94,7 @@ class TgWsProxyService : Service() {
                         _logFlow.tryEmit(it)
                     }
                     serviceScope.launch {
-                        kotlinx.coroutines.delay(1000)
+                        kotlinx.coroutines.delay(1000L shl (restartAttempts - 1))
                         if (_isRunning.value && !isStoppingExplicitly) {
                             val dynamicDomains = SettingsManager.getDynamicDomains(this@TgWsProxyService).joinToString(",")
                             val fallbackEnabled = SettingsManager.isCloudflareFallback(this@TgWsProxyService)
@@ -212,6 +212,7 @@ class TgWsProxyService : Service() {
     }
 
     private fun checkAndUpdateDomainsInBackground() {
+        if (!SettingsManager.isCloudflareFallback(this)) return
         val lastUpdate = SettingsManager.getLastDomainUpdate(this)
         val now = System.currentTimeMillis()
         if (now - lastUpdate > 24 * 60 * 60 * 1000L) {

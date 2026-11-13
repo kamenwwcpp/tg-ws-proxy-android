@@ -85,13 +85,15 @@ func main() {
 		go func() {
 			ticker := time.NewTicker(time.Duration(*statsIntervalFlag) * time.Second)
 			defer ticker.Stop()
+			var previous relay.Stats
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
 					snap := relay.GlobalStats.Snapshot()
-					if snap.ConnectionsTotal > 0 {
+					if snap != previous {
+						previous = snap
 						log.Printf("[Stats] Active: %d | Total: %d (WS: %d, FB: %d, Bad: %d) | Up: %.2f MB | Down: %.2f MB",
 							snap.ConnectionsActive, snap.ConnectionsTotal,
 							snap.ConnectionsWS, snap.ConnectionsFallback, snap.ConnectionsBad,

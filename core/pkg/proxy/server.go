@@ -67,6 +67,7 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	defer s.shutdownNetwork()
 	var clients sync.WaitGroup
+	slots := make(chan struct{}, 128)
 	defer clients.Wait()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -74,6 +75,11 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	defer stop()
 	defer ln.Close()
 	for {
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			return nil
+		}
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
@@ -86,11 +92,13 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		s.mu.Unlock()
 		if !available {
 			_ = conn.Close()
+			<-slots
 			continue
 		}
 		clients.Add(1)
 		go func() {
 			defer clients.Done()
+			defer func() { <-slots }()
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
 			stopNetwork := context.AfterFunc(network, cancel)
@@ -144,8 +152,7 @@ func (s *Server) handleClient(ctx context.Context, rawConn net.Conn) {
 		info, err := faketls.VerifyClientHello(clientHello, s.cfg.SecretBytes)
 		if err != nil {
 			logFakeTLSFailure()
-			redirect := fmt.Sprintf("HTTP/1.1 301 Moved Permanently\r\nLocation: https://%s/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", s.cfg.FakeTLSDomain)
-			_, _ = rawConn.Write([]byte(redirect))
+			rejectHandshake(rawConn)
 			return
 		}
 
@@ -169,8 +176,7 @@ func (s *Server) handleClient(ctx context.Context, rawConn net.Conn) {
 		}
 	} else if s.cfg.IsFakeTLS {
 		// Client connected with non-TLS byte while Fake TLS is enforced
-		redirect := fmt.Sprintf("HTTP/1.1 301 Moved Permanently\r\nLocation: https://%s/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", s.cfg.FakeTLSDomain)
-		_, _ = rawConn.Write([]byte(redirect))
+		rejectHandshake(rawConn)
 		return
 	} else {
 		// Raw MTProto
@@ -186,9 +192,7 @@ func (s *Server) handleClient(ctx context.Context, rawConn net.Conn) {
 	// Parse MTProto handshake
 	res, err := crypto.TryHandshake(handshake[:], s.cfg.SecretBytes)
 	if err != nil {
-		relay.GlobalStats.IncConnectionsBad()
-		_ = rawConn.SetReadDeadline(time.Now().Add(10 * time.Second))
-		_, _ = io.CopyN(io.Discard, clientConn, 64*1024)
+		rejectHandshake(rawConn)
 		return
 	}
 
@@ -533,4 +537,11 @@ func (s *Server) shutdownNetwork() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.stopNetwork()
+}
+
+// Give a client with stale settings time to back off before closing its socket.
+func rejectHandshake(conn net.Conn) {
+	relay.GlobalStats.IncConnectionsBad()
+	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_, _ = io.CopyN(io.Discard, conn, 64*1024)
 }

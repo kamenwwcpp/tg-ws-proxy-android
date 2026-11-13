@@ -73,7 +73,7 @@ class NativeProxyRunner(private val context: Context) {
             }
             if (!org.flowseal.tgwsproxy.util.SettingsManager.isCloudflareFallback(context)) add("-no-cf")
             add("-stats-interval")
-            add("5")
+            add("15")
         }
 
         try {
