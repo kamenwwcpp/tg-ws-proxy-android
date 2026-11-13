@@ -1,0 +1,12 @@
+<resources>
+    <color name="primary">#2AABEE</color>
+    <color name="primary_dark">#229ED9</color>
+    <color name="accent">#00C853</color>
+    <color name="bg_dark">#0E1621</color>
+    <color name="surface_dark">#17212B</color>
+    <color name="surface_card">#242F3D</color>
+    <color name="text_primary">#FFFFFF</color>
+    <color name="text_secondary">#8E9BA8</color>
+    <color name="status_active">#00E676</color>
+    <color name="status_inactive">#FF5252</color>
+</resources>

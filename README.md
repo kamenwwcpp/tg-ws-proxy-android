@@ -57,7 +57,7 @@
 
 Telegram подключается к локальному MTProto-прокси. Go-ядро выбирает WebSocket-маршрут до нужного дата-центра Telegram и пробует до трёх подключений одновременно. На мобильной сети может первым проверяться Cloudflare. Рабочий маршрут запоминается отдельно для типа сети, дата-центра и медиа.
 
-После смены сети ядро закрывает старые соединения и очищает пул WebSocket. Пока Android сообщает об отсутствии сети, прокси не запускает новых подключений. Настройки портов и адресов дата-центров, секрет Telegram, автоподъём и статистику обслуживает прежнее Android-приложение.
+В 1.3.9 используется Android-клиент keelbismark с настройками, логами, диагностикой и плиткой. При открытии приложение проверяет стабильные релизы на GitHub.
 
 Go-ядро взято из [keelbismark](https://github.com/keelbismark/tg-ws-proxy-android/commit/f7d850f2ea1d4e406e812323e7f81f1f34bd50e6) с правками [VintlGvard](https://github.com/VintlGvard/tg-ws-proxy-android/commit/9b8e96bd57ae8661fabfd8f084fadb86d4c46056). Условия использования ядра указаны в [core/LICENSE](core/LICENSE).
 
@@ -111,7 +111,7 @@ Telegram сам отключает прокси, когда сервер Telegra
 Нужны **Go** (1.25.4+), **Android SDK** с **NDK**, **JDK 17+**. Скрипты рассчитаны на Windows.
 
 ```bat
-:: 1. Нативное ядро для arm64-v8a и armeabi-v7a -> app/src/main/jniLibs
+:: 1. Нативное ядро для arm64-v8a и armeabi-v7a -> app/src/keelbismark/jniLibs
 powershell -ExecutionPolicy Bypass -File .\build_go.ps1
 
 :: 2. APK (universal, arm64, arm32) -> app/build/outputs/apk

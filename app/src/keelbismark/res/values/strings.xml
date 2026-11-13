@@ -1,0 +1,22 @@
+<resources>
+    <string name="app_name">TG WS Proxy</string>
+    <string name="status_stopped">Прокси остановлен</string>
+    <string name="status_running">Прокси работает на 127.0.0.1:%s</string>
+    <string name="btn_start">Запустить прокси</string>
+    <string name="btn_stop">Остановить</string>
+    <string name="btn_connect_telegram">Подключить в Telegram</string>
+    <string name="title_settings">Параметры подключения</string>
+    <string name="hint_port">Локальный порт (по умолч. 1443)</string>
+    <string name="hint_secret">Секрет (Fake TLS ee... или 32-hex)</string>
+    <string name="hint_domain">Fake TLS Домен (напр. google.com)</string>
+    <string name="switch_cf_fallback">Включить Cloudflare Fallback</string>
+    <string name="title_logs">Журнал работы</string>
+    <string name="notif_channel_name">Служба TG WS Proxy</string>
+    <string name="notif_running_text">Трафик Telegram перенаправляется через WebSocket</string>
+    <string name="action_stop">Остановить</string>
+    <string name="action_connect">Подключить</string>
+    <string name="update_available">Доступно обновление</string>
+    <string name="update_message">Версия %1$s доступна на GitHub.</string>
+    <string name="update_download">Скачать</string>
+    <string name="update_open_failed">Не удалось открыть страницу обновления</string>
+</resources>

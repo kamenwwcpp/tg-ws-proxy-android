@@ -19,11 +19,10 @@ try {
         $env:GOARCH = $target.Arch
         $env:GOARM = '7'
         $env:CC = '"' + (Join-Path $bin 'clang.exe') + '" --target=' + $target.Triple + $target.API
-        $dir = Join-Path $root "app/src/main/jniLibs/$($target.ABI)"
+        $dir = Join-Path $root "app/src/keelbismark/jniLibs/$($target.ABI)"
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
-        & $go build -trimpath -buildmode=c-shared -ldflags '-s -w -extldflags=-Wl,-z,max-page-size=16384' -o (Join-Path $dir 'libtgwsproxy.so') ./cmd/android
+        & $go build -trimpath -buildmode=pie -ldflags '-s -w -extldflags=-Wl,-z,max-page-size=16384' -o (Join-Path $dir 'libtgproxy.so') ./cmd/proxy
         if ($LASTEXITCODE -ne 0) { throw "Build failed for $($target.ABI)" }
-        Remove-Item -LiteralPath (Join-Path $dir 'libtgwsproxy.h')
     }
 } finally {
     Pop-Location

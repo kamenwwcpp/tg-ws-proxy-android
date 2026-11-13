@@ -22,11 +22,11 @@ echo Base prefix: %RELEASE_PREFIX%
 echo.
 
 set "MISSING=0"
-if not exist "app\src\main\jniLibs\arm64-v8a\libtgwsproxy.so" (
+if not exist "app\src\keelbismark\jniLibs\arm64-v8a\libtgproxy.so" (
     echo ERROR: arm64-v8a .so not found!
     set "MISSING=1"
 )
-if not exist "app\src\main\jniLibs\armeabi-v7a\libtgwsproxy.so" (
+if not exist "app\src\keelbismark\jniLibs\armeabi-v7a\libtgproxy.so" (
     echo ERROR: armeabi-v7a .so not found!
     set "MISSING=1"
 )
