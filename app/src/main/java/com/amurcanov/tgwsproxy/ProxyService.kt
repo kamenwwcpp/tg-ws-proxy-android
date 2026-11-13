@@ -224,7 +224,6 @@ class ProxyService : Service() {
                 }
                 runCatching {
                     NativeProxy.setPoolSize(cfg.poolSize)
-                    NativeProxy.setCfProxyCacheDir(cacheDir.absolutePath)
                     NativeProxy.setCfProxyConfig(cfg.cfEnabled, cfg.cfPriority, cfg.cfDomain)
                     NativeProxy.startProxy(cfg.bindIp, cfg.port, cfg.ips, cfg.secretKey, 1)
                 }

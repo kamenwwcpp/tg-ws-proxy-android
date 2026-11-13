@@ -9,7 +9,7 @@
 
 <a href="https://github.com/kamenwwcpp/tg-ws-proxy-android/releases/latest"><img src="https://img.shields.io/github/v/release/kamenwwcpp/tg-ws-proxy-android?style=for-the-badge&label=%D0%A1%D0%BA%D0%B0%D1%87%D0%B0%D1%82%D1%8C&color=2ea44f" alt="Скачать"></a>
 <img src="https://img.shields.io/badge/Android-5.0%2B-3DDC84?style=for-the-badge&logo=android&logoColor=white" alt="Android 5.0+">
-<img src="https://img.shields.io/badge/%D1%8F%D0%B4%D1%80%D0%BE-Rust-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust">
+<img src="https://img.shields.io/badge/%D1%8F%D0%B4%D1%80%D0%BE-Go-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="Go">
 <a href="https://github.com/kamenwwcpp/tg-ws-proxy-android/stargazers"><img src="https://img.shields.io/github/stars/kamenwwcpp/tg-ws-proxy-android?style=for-the-badge&logo=github&color=ffca28&labelColor=24292e" alt="Stars"></a>
 
 </div>
@@ -20,7 +20,7 @@
 
 ## Что это
 
-Приложение поднимает на телефоне прокси `127.0.0.1:1443`, к которому подключается Telegram. Дальше прокси сам ищет рабочий путь до серверов Telegram: напрямую через WebSocket, через обходной SNI, по TCP или через Cloudflare — и запоминает, что работает именно в твоей сети.
+Приложение поднимает на телефоне прокси `127.0.0.1:1443`, к которому подключается Telegram. Дальше прокси сам ищет рабочий путь до серверов Telegram: через WebSocket напрямую или через Cloudflare — и запоминает, что работает именно в твоей сети.
 
 - **Не VPN.** Трафик других приложений не трогается, VPN-слот остаётся свободным — можно одновременно пользоваться любым VPN.
 - **Не нужен свой сервер или подписка.** Прокси работает на самом телефоне, сообщения Telegram остаются зашифрованы как обычно.
@@ -55,30 +55,12 @@
 
 ## Как это работает
 
-```text
-Telegram ──► 127.0.0.1:1443 (MTProto, локально) ──► TG WS Proxy ──┬─► WebSocket (TLS) напрямую к Telegram
-                                                                   ├─► WebSocket с обходным SNI (fronting)
-                                                                   ├─► TCP напрямую к дата-центру
-                                                                   └─► WebSocket через Cloudflare
-```
+Telegram подключается к локальному MTProto-прокси. Go-ядро выбирает WebSocket-маршрут до нужного дата-центра Telegram и пробует до трёх подключений одновременно. На мобильной сети может первым проверяться Cloudflare. Рабочий маршрут запоминается отдельно для типа сети, дата-центра и медиа.
 
-Ядро прокси написано на **Rust**, интерфейс — на Kotlin и Jetpack Compose. Для каждого подключения Telegram прокси определяет нужный дата-центр и выбирает маршрут:
+После смены сети ядро закрывает старые соединения и очищает пул WebSocket. Пока Android сообщает об отсутствии сети, прокси не запускает новых подключений. Настройки портов и адресов дата-центров, секрет Telegram, автоподъём и статистику обслуживает прежнее Android-приложение.
 
-- **Сначала прямой путь** — WebSocket по TLS к Telegram; если он не отвечает, пробуется обходной SNI.
-- **Если прямой путь режут** — TCP к дата-центру, а затем Cloudflare. Из 20+ доменов CF берётся первый ответивший.
-- **Пул готовых соединений** держит несколько прогретых WebSocket'ов, чтобы Telegram не ждал рукопожатий.
+Go-ядро взято из [keelbismark](https://github.com/keelbismark/tg-ws-proxy-android/commit/f7d850f2ea1d4e406e812323e7f81f1f34bd50e6) с правками [VintlGvard](https://github.com/VintlGvard/tg-ws-proxy-android/commit/9b8e96bd57ae8661fabfd8f084fadb86d4c46056). Условия использования ядра указаны в [core/LICENSE](core/LICENSE).
 
-### Адаптация под сеть
-
-Прокси не перебирает всё заново при каждом подключении, а учится на ошибках:
-
-| Ситуация | Что делает прокси |
-|---|---|
-| **Прямой путь не отвечает на LTE** | Блокирует его с первого таймаута и сразу ведёт Telegram через обход. Запоминает это **для мобильной сети отдельно** — на Wi-Fi прямой путь продолжает работать. В фоне пул проверяет, не ожил ли прямой путь, и снимает блок сам. |
-| **Прямой путь сбоит на Wi-Fi** | Мягче: блок только после двух таймаутов подряд и на 2 минуты. |
-| **Сети нет** (туннель, лифт) | Не пытается подключаться и не записывает провалы в блокировки — когда сеть вернётся, всё работает сразу. |
-| **Сменилась сеть** (Wi-Fi ↔ LTE) | Сбрасывает соединения и блокировки прошлой сети, но помнит, какой маршрут работал в этом типе сети. |
-| **Подряд ничего не работает** | Через 4 неудачи сам сбрасывает все блокировки и пул — без ручного перезапуска. |
 
 ## Если что-то не работает
 
@@ -126,11 +108,11 @@ Telegram сам отключает прокси, когда сервер Telegra
 
 ## Сборка из исходников
 
-Нужны **Rust** (1.82+), **Android SDK** с **NDK**, **JDK 17+**. Скрипты рассчитаны на Windows.
+Нужны **Go** (1.25.4+), **Android SDK** с **NDK**, **JDK 17+**. Скрипты рассчитаны на Windows.
 
 ```bat
 :: 1. Нативное ядро для arm64-v8a и armeabi-v7a -> app/src/main/jniLibs
-build_so.bat
+powershell -ExecutionPolicy Bypass -File .\build_go.ps1
 
 :: 2. APK (universal, arm64, arm32) -> app/build/outputs/apk
 gradlew.bat assembleRelease

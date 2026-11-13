@@ -127,4 +127,8 @@
     <string name="interval_never">Never</string>
     <string name="interval_hours">%1$d h</string>
     <string name="port_is_not_available">Port %1$d is in use, please try another one</string>
+    <string name="dashboard_start">Start proxy</string>
+    <string name="dashboard_stop">Stop proxy</string>
+    <string name="dashboard_cf_on">Cloudflare on</string>
+    <string name="dashboard_cf_off">Cloudflare off</string>
 </resources>

@@ -127,4 +127,8 @@
     <string name="interval_never">Никогда</string>
     <string name="interval_hours">%1$d ч</string>
     <string name="port_is_not_available">"Порт %1$d используется, пожалуйста попробуйте другой "</string>
+    <string name="dashboard_start">Запустить прокси</string>
+    <string name="dashboard_stop">Остановить прокси</string>
+    <string name="dashboard_cf_on">Cloudflare включён</string>
+    <string name="dashboard_cf_off">Cloudflare выключен</string>
 </resources>

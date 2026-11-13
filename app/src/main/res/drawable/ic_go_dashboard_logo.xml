@@ -1,0 +1,52 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+
+    <!-- Outer Soft Glow -->
+    <path
+        android:fillColor="#252AABEE"
+        android:pathData="M 24, 4 C 30, 6.5 35.5, 7.8 38.5, 9 C 38.5, 23.5 34.5, 35.5 24, 44 C 13.5, 35.5 9.5, 23.5 9.5, 9 C 12.5, 7.8 18, 6.5 24, 4 Z" />
+
+    <!-- Shield Body with Telegram Blue Gradient -->
+    <path
+        android:pathData="M 24, 5.5 C 29.5, 7.8 34.5, 9 37.5, 10 C 37.5, 23 33.5, 34 24, 41.5 C 14.5, 34 10.5, 23 10.5, 10 C 13.5, 9 18.5, 7.8 24, 5.5 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="24"
+                android:startY="5.5"
+                android:endX="24"
+                android:endY="41.5"
+                android:startColor="#38B9FF"
+                android:endColor="#1565C0" />
+        </aapt:attr>
+    </path>
+
+    <!-- Inner Shield Rim -->
+    <path
+        android:strokeColor="#55FFFFFF"
+        android:strokeWidth="0.8"
+        android:pathData="M 24, 7 C 29, 9 33.5, 10 36, 11 C 36, 22 32.5, 31.5 24, 38.5 C 15.5, 31.5 12, 22 12, 11 C 14.5, 10 19, 9 24, 7 Z" />
+
+    <!-- Telegram Paper Plane -->
+    <group
+        android:scaleX="0.95"
+        android:scaleY="0.95"
+        android:translateX="12.6"
+        android:translateY="12.5">
+
+        <!-- Main Wings (Pure Crisp White) -->
+        <path
+            android:fillColor="#FFFFFF"
+            android:pathData="M9.78,18.65l0.28,-4.23l7.68,-6.92c0.34,-0.31 -0.07,-0.46 -0.52,-0.19L7.74,13.3L3.64,12c-0.88,-0.25 -0.89,-0.86 0.2,-1.3l15.97,-6.16c0.73,-0.33 1.43,0.18 1.15,1.3l-2.72,12.81c-0.19,0.91 -0.74,1.13 -1.5,0.71L12.6,16.3l-1.99,1.93C10.4,18.45 10.23,18.65 9.78,18.65z" />
+
+        <!-- 3D Crease Shading -->
+        <path
+            android:fillColor="#BCD7EF"
+            android:pathData="M10.06,14.42 L12.6,16.3 L10.61,18.23 Z" />
+    </group>
+
+</vector>

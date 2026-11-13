@@ -33,7 +33,7 @@ if not exist "app\src\main\jniLibs\armeabi-v7a\libtgwsproxy.so" (
 
 if "%MISSING%"=="1" (
     echo.
-    echo Run build_so.bat first to build all native libraries!
+    echo Run build_go.ps1 first to build all native libraries!
     pause
     exit /b 1
 )
