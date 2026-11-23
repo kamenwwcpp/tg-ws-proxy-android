@@ -15,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 // ---------------------------------------------------------------------------
 // Fronting flag — proxy/pool.py::_WsPool.try_fronting_first. Апстрим (50c980e)
@@ -711,9 +712,17 @@ impl CfWorkerPool {
         domains
     }
 
-    pub async fn report_failure(&self, _worker_domain: &str, _exc: &WsError) {
-        // TODO: picks up 429/daily-limit handling — как в оригинале пока no-op.
-        return;
+    pub async fn report_failure(&self, worker_domain: &str, exc: &WsError) {
+        let now = now_unix_f64();
+        let until = match exc {
+            WsError::Handshake(h) if h.status_code == 429 => (now / 86400.0).floor() * 86400.0 + 86400.0,
+            WsError::Handshake(h) if (500..600).contains(&h.status_code) => now + 60.0,
+            WsError::Io(_) | WsError::Timeout => now + 60.0,
+            _ => return,
+        };
+        let mut exhausted = self.exhausted_until.lock().await;
+        let entry = exhausted.entry(worker_domain.to_owned()).or_insert(0.0);
+        *entry = entry.max(until);
     }
 
     pub async fn warmup(self: &Arc<Self>, dc_opt_map: &HashMap<i32, String>) {
@@ -845,7 +854,7 @@ pub async fn bridge_ws<R, W>(
     let la_ping = last_activity.clone();
     let cancel_ping = cancel.clone();
     let cancel_token_ping = cancel_token.clone();
-    let ping_task = tokio::spawn(async move {
+    let ping_task = AbortOnDropHandle::new(tokio::spawn(async move {
         let mut interval = tokio::time::interval(BRIDGE_PING_INTERVAL / 2);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await;
@@ -864,7 +873,7 @@ pub async fn bridge_ws<R, W>(
                 }
             }
         }
-    });
+    }));
 
     // up: client -> ws
     let ws_up = ws.clone();
@@ -877,7 +886,7 @@ pub async fn bridge_ws<R, W>(
     let up_packets_c = up_packets.clone();
     let close_reason_up = Arc::new(Mutex::new(String::new()));
     let close_reason_up_c = close_reason_up.clone();
-    let up_task = tokio::spawn(async move {
+    let up_task = AbortOnDropHandle::new(tokio::spawn(async move {
         let mut buf = vec![0u8; WS_BRIDGE_CHUNK_SIZE];
         loop {
             let read_res = tokio::select! {
@@ -946,7 +955,7 @@ pub async fn bridge_ws<R, W>(
             }
         }
         cancel_up.cancel();
-    });
+    }));
 
     // down: ws -> client
     let ws_down = ws.clone();
@@ -959,7 +968,7 @@ pub async fn bridge_ws<R, W>(
     let down_packets_c = down_packets.clone();
     let close_reason_down = Arc::new(Mutex::new(String::new()));
     let close_reason_down_c = close_reason_down.clone();
-    let down_task = tokio::spawn(async move {
+    let down_task = AbortOnDropHandle::new(tokio::spawn(async move {
         loop {
             let recv_res = tokio::select! {
                 _ = cancel_token_down.cancelled() => break,
@@ -990,14 +999,17 @@ pub async fn bridge_ws<R, W>(
 
             tg_dec.xor(&mut data);
             clt_enc.xor(&mut data);
-            let wr = conn_write.write_all(&data).await;
+            let wr = tokio::select! {
+                _ = cancel_down.cancelled() => break,
+                r = conn_write.write_all(&data) => r,
+            };
             if wr.is_err() {
                 *close_reason_down_c.lock().await = "client: write_failed".to_string();
                 break;
             }
         }
         cancel_down.cancel();
-    });
+    }));
 
     let _ = up_task.await;
     let _ = down_task.await;
@@ -2480,19 +2492,24 @@ pub async fn run_proxy(
     // сокета (как у форка Alexingin; аналог listener watchdog в Flowseal).
     let mut listener = listener;
     let mut accept_errors: u32 = 0;
+    let mut clients = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             _ = cancel_root.cancelled() => {
                 break;
             }
+            _ = clients.join_next(), if !clients.is_empty() => {}
             accept = listener.accept() => {
                 match accept {
                     Ok((conn, _)) => {
                         accept_errors = 0;
                         let p = pools.clone();
                         let cancel = cancel_root.child_token();
-                        tokio::spawn(async move {
-                            handle_client(p, conn, cancel).await;
+                        clients.spawn(async move {
+                            tokio::select! {
+                                _ = cancel.cancelled() => {}
+                                _ = handle_client(p, conn, cancel.clone()) => {}
+                            }
                         });
                     }
                     Err(e) => {
@@ -2537,7 +2554,7 @@ pub async fn run_proxy(
 
     drop(listener);
     cancel_root.cancel();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    while clients.join_next().await.is_some() {}
     pools.close_all().await;
     Ok(())
 }

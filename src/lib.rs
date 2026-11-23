@@ -184,10 +184,13 @@ pub extern "C" fn StopProxy() -> c_int {
 
     let rt = runtime();
     let pools = state.pools.clone();
-    let handle = state.handle;
+    let mut handle = state.handle;
     rt.block_on(async move {
         linfo!("StopProxy: waiting for proxy tasks to finish (max 2s)");
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle).await.is_err() {
+            handle.abort();
+            let _ = handle.await;
+        }
         linfo!("StopProxy: closing pool connections");
         pools.close_all().await;
         pools.reset().await;
